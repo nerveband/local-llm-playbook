@@ -6,10 +6,30 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const DEFAULT_MAX_TOOL_CHARS = Number(process.env.PI_LOCAL_MAX_TOOL_CHARS || 6000);
 const DEFAULT_MAX_TOOL_LINES = Number(process.env.PI_LOCAL_MAX_TOOL_LINES || 120);
-const DEFAULT_MAX_READ_CHARS = Number(process.env.PI_LOCAL_MAX_READ_CHARS || 14000);
-const DEFAULT_MAX_READ_LINES = Number(process.env.PI_LOCAL_MAX_READ_LINES || 260);
+const DEFAULT_MAX_READ_CHARS = Number(process.env.PI_LOCAL_MAX_READ_CHARS || 20000);
+const DEFAULT_MAX_READ_LINES = Number(process.env.PI_LOCAL_MAX_READ_LINES || 400);
+const DEFAULT_MAX_EXEMPT_DOC_CHARS = Number(process.env.PI_LOCAL_MAX_EXEMPT_DOC_CHARS || 36000);
 
 const GUARDED_SHELL_TOOLS = new Set(["bash", "powershell", "grep", "find", "ls"]);
+const EXEMPT_DOC_PATH_RE =
+  /(?:^|\/)(?:SKILL|PROMPT|AGENTS|CLAUDE|notes)\.md\b|\.pi-handoff(?:\.last)?\.md\b|\/(?:skills|skills-shared|skillshare|prompts)\/[^\s'"]*|\/reference\/[^\s'"]+\.md\b/i;
+const SHELL_READ_CMD_RE = /\b(?:cat|head|tail|sed|bat|less)\b/;
+
+function isExemptInstructionTarget(
+  toolName: string,
+  input: Record<string, unknown> | undefined,
+): boolean {
+  if (!input) return false;
+  if (toolName === "read") {
+    const filePath = String(input.path ?? input.file_path ?? "");
+    return EXEMPT_DOC_PATH_RE.test(filePath);
+  }
+  if (toolName === "bash") {
+    const cmd = typeof input.command === "string" ? input.command : "";
+    return SHELL_READ_CMD_RE.test(cmd) && EXEMPT_DOC_PATH_RE.test(cmd);
+  }
+  return false;
+}
 
 function slugifyCwd(cwd: string): string {
   const cleaned = cwd.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
@@ -162,8 +182,14 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     let maxLines = 0;
     let headKeep = 35;
     let tailKeep = 45;
+    const exemptDoc = isExemptInstructionTarget(toolName, event.input);
 
-    if (GUARDED_SHELL_TOOLS.has(toolName)) {
+    if (exemptDoc) {
+      maxChars = DEFAULT_MAX_EXEMPT_DOC_CHARS;
+      maxLines = 0;
+      headKeep = 160;
+      tailKeep = 80;
+    } else if (GUARDED_SHELL_TOOLS.has(toolName)) {
       maxChars = DEFAULT_MAX_TOOL_CHARS;
       maxLines = DEFAULT_MAX_TOOL_LINES;
       if (event.isError) {
@@ -180,7 +206,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     const needsTrim =
       maxChars > 0 &&
       fullText.length > 0 &&
-      (fullText.length > maxChars || lineCount > maxLines);
+      (fullText.length > maxChars || (maxLines > 0 && lineCount > maxLines));
 
     if (!needsTrim && hints.length === 0) {
       return;

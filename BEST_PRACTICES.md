@@ -38,7 +38,7 @@ Instead of letting a single long run hit emergency compaction, let the model swi
 
 - `extensions/local-phase-handoff.ts` gives the model a `phase_handoff` tool that writes `.pi-handoff.md` with the completed summary, key files on disk (`notes.md`, scripts, JSON outputs), and the exact next-phase task.
 - At `40,000` tokens (or `72%` of the window, whichever comes first), a `tool_result` notice whispers once to the model to wrap up `notes.md` and call `phase_handoff` at the next milestone before long-context decode slows down.
-- `extensions/local-context-guard.ts` trims oversized `bash`/`grep`/`find`/`ls`/`read` outputs at insertion time (keeping head + tail lines and spilling full logs to `/tmp/pi-local-tool-logs`) so context grows slowly without mutating prior history.
+- `extensions/local-context-guard.ts` trims oversized noisy `bash`/`grep`/`find`/`ls` (`>6,000` chars / `120` lines) and `read` (`>20,000` chars / `400` lines) outputs at insertion time while keeping skill/reference/instruction docs (`SKILL.md`, `notes.md`, `PROMPT.md`, `/skills*/`, `/reference/*.md`) intact up to `36,000` chars and spilling trimmed logs to `/tmp/pi-local-tool-logs` so context grows slowly without mutating prior history.
 - **Two modes controlled by `auto_continue`:**
   - `auto_continue: false` (default): Model writes `.pi-handoff.md`, stops calling tools, and waits so you can inspect deliverables and run `/next-phase` when ready.
   - `auto_continue: true`: When you want hands-free execution across phases, `agent_end` automatically runs `/next-phase` (`ctx.newSession`), opening a fresh clean window with `.pi-handoff.md` as its starting prompt (capped at `3` auto-hops per run for loop safety).
