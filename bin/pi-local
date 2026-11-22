@@ -10,7 +10,9 @@ THINK="medium"
 USE_SUBAGENTS=0
 USE_CONTINUE=1
 USE_RULES=1
+USE_PHASE_TOOL=1
 NO_AGENTS_MD=0
+PRINT_CMD=0
 
 usage() {
   cat <<'EOF'
@@ -24,10 +26,13 @@ Options:
   --ornith         Use local Ornith 1.5 35B-A3B model on port 8000 (thinking: high)
   --model <id>     Override provider/model id (default: inkling-local/inkling)
   --think <level>  Override thinking level: off, minimal, low, medium, high, xhigh, max
+  --no-think       Shortcut for --think off
   --subagents      Load isolated pi-subagents extension for multi-step delegation
   --no-continue    Skip pi-continue extension (handoff-only workflow)
+  --no-phase-tool  Skip local phase_handoff tool / /next-phase extension
   --no-rules       Do not append prompts/local-lean-rules.md
   --bare           Skip global AGENTS.md / CLAUDE.md context files for minimum tokens
+  --print-cmd      Print the resolved pi command and exit without starting pi
   -h, --help       Show this help and exit
 
 All remaining flags and arguments pass directly to pi (for example: -p, -c, -r, --no-session).
@@ -35,9 +40,10 @@ All remaining flags and arguments pass directly to pi (for example: -p, -c, -r, 
 Examples:
   pi-local
   pi-local --bare
-  pi-local --think low -p "Inspect Transactions.csv headers"
+  pi-local --think low -p "Inspect dataset headers"
   pi-local --subagents
   pi-local --ornith
+  pi-local --ornith --no-think
 EOF
 }
 
@@ -64,6 +70,10 @@ while [[ $# -gt 0 ]]; do
       THINK="$2"
       shift 2
       ;;
+    --no-think)
+      THINK="off"
+      shift
+      ;;
     --subagents)
       USE_SUBAGENTS=1
       shift
@@ -72,12 +82,20 @@ while [[ $# -gt 0 ]]; do
       USE_CONTINUE=0
       shift
       ;;
+    --no-phase-tool)
+      USE_PHASE_TOOL=0
+      shift
+      ;;
     --no-rules)
       USE_RULES=0
       shift
       ;;
     --bare)
       NO_AGENTS_MD=1
+      shift
+      ;;
+    --print-cmd)
+      PRINT_CMD=1
       shift
       ;;
     -h|--help)
@@ -94,9 +112,32 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+port_http_code() {
+  local url="$1"
+  local code="000"
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "$url" 2>/dev/null || true)
+  if [[ -z "$code" ]]; then
+    code="000"
+  fi
+  print -r -- "$code"
+}
+
+INKLING_CODE=$(port_http_code "http://127.0.0.1:18089/v1/models")
+ORNITH_CODE=$(port_http_code "http://127.0.0.1:8000/v1/models")
+
 if [[ "$MODEL" == inkling-local/* ]]; then
-  if ! curl -sf --max-time 1 http://127.0.0.1:18089/v1/models >/dev/null 2>&1; then
+  if [[ "$INKLING_CODE" == "000" ]]; then
     print -u2 "Warning: inkling-omlx is not reachable on http://127.0.0.1:18089 (start it with: inkling-omlx start)"
+  fi
+  if [[ "$ORNITH_CODE" != "000" ]]; then
+    print -u2 "Note: oMLX desktop port 8000 is also listening. Unload Ornith before heavy Inkling sessions to protect browser RAM."
+  fi
+elif [[ "$MODEL" == omlx-local/* || "$MODEL" == omlx/* ]]; then
+  if [[ "$ORNITH_CODE" == "000" ]]; then
+    print -u2 "Warning: oMLX desktop server for Ornith is not reachable on http://127.0.0.1:8000 (open oMLX.app to start it)"
+  fi
+  if [[ "$INKLING_CODE" != "000" ]]; then
+    print -u2 "Warning: inkling-omlx is also running on port 18089. Run 'inkling-omlx stop' before using Ornith so both models do not compete for 64 GiB RAM."
   fi
 fi
 
@@ -126,6 +167,10 @@ add_ext() {
   fi
 }
 
+if [[ "$USE_PHASE_TOOL" == "1" ]]; then
+  add_ext "$REPO_DIR/extensions/local-phase-handoff.ts"
+fi
+
 add_ext "$LOCAL_EXT_ROOT/pi-handoff/extensions/handoff.ts"
 if [[ "$USE_CONTINUE" == "1" ]]; then
   add_ext "$LOCAL_EXT_ROOT/pi-continue/extensions/continue/index.ts"
@@ -137,5 +182,10 @@ fi
 add_ext "$GLOBAL_EXT_ROOT/pi-token-speed/src/index.ts"
 add_ext "$GLOBAL_EXT_ROOT/@erichll/pi-statusline/src/index.ts"
 add_ext "$GLOBAL_EXT_ROOT/pi-tool-repair/tool-repair.ts"
+
+if [[ "$PRINT_CMD" == "1" ]]; then
+  print -r -- "pi ${(q-)ARGS[@]} ${(q-)@}"
+  exit 0
+fi
 
 exec pi "${ARGS[@]}" "$@"
