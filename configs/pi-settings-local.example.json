@@ -1,0 +1,13 @@
+{
+  "modelThinkingLevels": {
+    "inkling-local/inkling": "medium"
+  },
+  "compaction": {
+    "modelOverrides": {
+      "inkling-local/inkling": {
+        "reserveTokens": 24576,
+        "keepRecentTokens": 12000
+      }
+    }
+  }
+}

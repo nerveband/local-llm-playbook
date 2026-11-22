@@ -1,0 +1,141 @@
+#!/bin/zsh
+set -euo pipefail
+
+SCRIPT_PATH="${0:A}"
+SCRIPT_DIR="${SCRIPT_PATH:h}"
+REPO_DIR="${SCRIPT_DIR:h}"
+
+MODEL="inkling-local/inkling"
+THINK="medium"
+USE_SUBAGENTS=0
+USE_CONTINUE=1
+USE_RULES=1
+NO_AGENTS_MD=0
+
+usage() {
+  cat <<'EOF'
+Usage: pi-local [pi-local options] [pi options / prompt...]
+
+Lean Pi launcher for local Apple Silicon oMLX models (Inkling 2 Mini and Ornith).
+Skips global skills, MCP servers, codemode, and cloud extensions to minimize prompt tokens
+and preserve oMLX KV prefix caching.
+
+Options:
+  --ornith         Use local Ornith 1.5 35B-A3B model on port 8000 (thinking: high)
+  --model <id>     Override provider/model id (default: inkling-local/inkling)
+  --think <level>  Override thinking level: off, minimal, low, medium, high, xhigh, max
+  --subagents      Load isolated pi-subagents extension for multi-step delegation
+  --no-continue    Skip pi-continue extension (handoff-only workflow)
+  --no-rules       Do not append prompts/local-lean-rules.md
+  --bare           Skip global AGENTS.md / CLAUDE.md context files for minimum tokens
+  -h, --help       Show this help and exit
+
+All remaining flags and arguments pass directly to pi (for example: -p, -c, -r, --no-session).
+
+Examples:
+  pi-local
+  pi-local --bare
+  pi-local --think low -p "Inspect Transactions.csv headers"
+  pi-local --subagents
+  pi-local --ornith
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --ornith)
+      MODEL="omlx-local/Ornith-1.5-35B-A3B-Abliterated-MLX-4bit"
+      THINK="high"
+      shift
+      ;;
+    --model)
+      if [[ $# -lt 2 ]]; then
+        print -u2 "Error: --model requires an argument"
+        exit 2
+      fi
+      MODEL="$2"
+      shift 2
+      ;;
+    --think)
+      if [[ $# -lt 2 ]]; then
+        print -u2 "Error: --think requires an argument"
+        exit 2
+      fi
+      THINK="$2"
+      shift 2
+      ;;
+    --subagents)
+      USE_SUBAGENTS=1
+      shift
+      ;;
+    --no-continue)
+      USE_CONTINUE=0
+      shift
+      ;;
+    --no-rules)
+      USE_RULES=0
+      shift
+      ;;
+    --bare)
+      NO_AGENTS_MD=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ "$MODEL" == inkling-local/* ]]; then
+  if ! curl -sf --max-time 1 http://127.0.0.1:18089/v1/models >/dev/null 2>&1; then
+    print -u2 "Warning: inkling-omlx is not reachable on http://127.0.0.1:18089 (start it with: inkling-omlx start)"
+  fi
+fi
+
+ARGS=(
+  --model "${MODEL}:${THINK}"
+  --no-mcp
+  --no-skills
+  --no-extensions
+  --exclude-tools codemode
+)
+
+if [[ "$NO_AGENTS_MD" == "1" ]]; then
+  ARGS+=(--no-context-files)
+fi
+
+if [[ "$USE_RULES" == "1" && -f "$REPO_DIR/prompts/local-lean-rules.md" ]]; then
+  ARGS+=(--append-system-prompt "$REPO_DIR/prompts/local-lean-rules.md")
+fi
+
+LOCAL_EXT_ROOT="$HOME/.local/share/pi-local-extensions/node_modules"
+GLOBAL_EXT_ROOT="$HOME/.pi/agent/npm/node_modules"
+
+add_ext() {
+  local ext_path="$1"
+  if [[ -f "$ext_path" ]]; then
+    ARGS+=(-e "$ext_path")
+  fi
+}
+
+add_ext "$LOCAL_EXT_ROOT/pi-handoff/extensions/handoff.ts"
+if [[ "$USE_CONTINUE" == "1" ]]; then
+  add_ext "$LOCAL_EXT_ROOT/pi-continue/extensions/continue/index.ts"
+fi
+if [[ "$USE_SUBAGENTS" == "1" ]]; then
+  add_ext "$LOCAL_EXT_ROOT/pi-subagents/bundle/index.js"
+fi
+
+add_ext "$GLOBAL_EXT_ROOT/pi-token-speed/src/index.ts"
+add_ext "$GLOBAL_EXT_ROOT/@erichll/pi-statusline/src/index.ts"
+add_ext "$GLOBAL_EXT_ROOT/pi-tool-repair/tool-repair.ts"
+
+exec pi "${ARGS[@]}" "$@"

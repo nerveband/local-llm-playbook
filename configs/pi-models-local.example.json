@@ -1,0 +1,75 @@
+{
+  "providers": {
+    "inkling-local": {
+      "baseUrl": "http://127.0.0.1:18089/v1",
+      "api": "openai-completions",
+      "apiKey": "local-placeholder",
+      "models": [
+        {
+          "id": "inkling",
+          "name": "Inkling 2 Mini (oMLX M1-fast)",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": [
+            "text"
+          ],
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "contextWindow": 131072,
+          "maxTokens": 16384,
+          "compat": {
+            "thinkingFormat": "openai",
+            "supportsReasoningEffort": true,
+            "maxTokensField": "max_tokens"
+          }
+        }
+      ]
+    },
+    "omlx-local": {
+      "baseUrl": "http://127.0.0.1:8000/v1",
+      "api": "openai-completions",
+      "apiKey": "YOUR_OMLX_API_KEY",
+      "authHeader": true,
+      "models": [
+        {
+          "id": "Ornith-1.5-35B-A3B-Abliterated-MLX-4bit",
+          "name": "Ornith 1.5 Abliterated",
+          "reasoning": true,
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "contextWindow": 262144,
+          "maxTokens": 32768,
+          "compat": {
+            "thinkingFormat": "qwen-chat-template"
+          },
+          "thinkingLevelMap": {
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": "high"
+          }
+        }
+      ]
+    }
+  }
+}
