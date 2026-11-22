@@ -6,7 +6,7 @@ Personal playbook, extensions, copy-paste prompt templates, example Pi configura
 
 Global Pi setups often load cloud-oriented packages, skill catalogs, `codemode`, and extra tool definitions that can exceed `11,000` base tokens before your first message. On local Apple Silicon **oMLX** servers, every prefix-cache miss or compaction reset has to re-prefill that entire static prefix on-device.
 
-`pi-local` runs `pi` with `--no-mcp`, `--no-skills`, `--no-extensions`, and `--exclude-tools codemode`, loads only local-friendly extensions from an isolated directory (`~/.local/share/pi-local-extensions`), and includes a custom `phase_handoff` + `/next-phase` extension so local models can trigger clean session resets themselves without touching your cloud `pi` config.
+`pi-local` handles everything from one command: shows an interactive model picker when launched in a terminal, stops any competing local model so Inkling and Ornith never collide inside `64 GiB` RAM, starts the chosen server if it is stopped, strips heavy cloud tools (`--no-mcp --no-skills --no-extensions --exclude-tools codemode`), and loads `phase_handoff` + `/next-phase` for clean phase transitions.
 
 ### Measured baseline prompt reduction (Inkling 2 Mini on M1 Max)
 
@@ -26,34 +26,41 @@ Install the isolated local Pi extensions and link `pi-local` into `~/.local/bin`
 ./scripts/install-local-extensions.sh
 ```
 
-Launch with Inkling 2 Mini (port `18089`):
+Run `pi-local` (or `pi-local --bare`) in any project folder:
 
 ```zsh
-# Default: Inkling 2 Mini (128K context, medium thinking, lean rules, phase_handoff)
-pi-local
-
-# Smallest prompt with self-handoff enabled (2,376 tokens, skips global AGENTS.md/CLAUDE.md)
 pi-local --bare
-
-# Enable sequential isolated subagent delegation
-pi-local --subagents
-
-# Override thinking level for lighter CSV/script exploration
-pi-local --think low
 ```
 
-Launch with **Ornith 1.5 35B-A3B** (desktop **oMLX** on port `8000`):
+You get an interactive menu with live status:
+
+```text
+pi-local: choose local model
+  1) Inkling 2 Mini (128K, medium thinking, port 18089) [running]
+  2) Ornith 1.5 35B-A3B (thinking ON, port 8000)        [stopped]
+  3) Ornith 1.5 35B-A3B (thinking OFF, port 8000)       [stopped]
+  4) Stop all local models and exit
+```
+
+Picking any option automatically quits the competing model server if active, starts the chosen model server if stopped, waits until ready, and launches Pi cleanly.
+
+### Direct shortcut flags (skip picker)
 
 ```zsh
-# Stop Inkling first so both models do not compete for 64 GiB RAM, then open oMLX.app
-inkling-omlx stop
-
-# Run Ornith with thinking ON (high) or OFF (--no-think)
+# Launch directly without showing the picker menu
+pi-local --inkling
+pi-local --inkling --bare --think low
 pi-local --ornith
 pi-local --ornith --no-think
-```
+pi-local --inkling --subagents
 
-Use `--print-cmd` on any invocation to inspect resolved flags and RAM/port checks without starting `pi`.
+# Stop both local servers to free all GPU RAM
+pi-local --stop-all
+
+# Skip auto stop/start or inspect resolved flags without launching
+pi-local --ornith --no-autostart
+pi-local --ornith --print-cmd
+```
 
 ## Self-triggered phase handoffs (`phase_handoff` + `/next-phase`)
 
@@ -64,7 +71,7 @@ Use `--print-cmd` on any invocation to inspect resolved flags and RAM/port check
 
 ## Included files
 
-- [`bin/pi-local`](bin/pi-local): Lean launcher script (`pi-local --help` for all options, Inkling + Ornith RAM/port checks).
+- [`bin/pi-local`](bin/pi-local): Interactive picker + auto server lifecycle manager + lean Pi launcher (`pi-local --help`).
 - [`extensions/local-phase-handoff.ts`](extensions/local-phase-handoff.ts): Self-triggered `phase_handoff` tool, `72%` context notice, and `/next-phase` session switcher.
 - [`scripts/install-local-extensions.sh`](scripts/install-local-extensions.sh): Installs `pi-handoff`, `pi-continue`, and `pi-subagents` into `~/.local/share/pi-local-extensions` and symlinks `pi-local`.
 - [`prompts/local-lean-rules.md`](prompts/local-lean-rules.md): Short system prompt rules for disk-backed state (`notes.md`), schema-first inspection, `.py` scripts, capped stdout, and `phase_handoff`.
@@ -75,5 +82,6 @@ Use `--print-cmd` on any invocation to inspect resolved flags and RAM/port check
 
 ## Changelog
 
-- `2026-11-21`: Added custom `extensions/local-phase-handoff.ts` (`phase_handoff` tool + `/next-phase` auto/manual handoffs + `72%` context notice), full Ornith support (`--ornith`, `--no-think`, `--print-cmd`, compaction override `reserveTokens: 131072`, 64 GiB dual-model RAM warnings), and measured `2,376`-token `pi-local --bare` verification.
+- `2026-11-21`: Added interactive model picker and automatic stop/start server lifecycle management to `pi-local` (Inkling, Ornith thinking ON/OFF, `--stop-all`, `--inkling`, `--pick`, `--no-autostart`).
+- `2026-11-21`: Added custom `extensions/local-phase-handoff.ts` (`phase_handoff` tool + `/next-phase` auto/manual handoffs + `72%` context notice), full Ornith support (`--ornith`, `--no-think`, `--print-cmd`, compaction override `reserveTokens: 131072`), and measured `2,376`-token `pi-local --bare` verification.
 - `2026-11-21`: Initial playbook, `pi-local` lean launcher, isolated local extensions (`pi-handoff`, `pi-continue`, `pi-subagents`), and `128K` + `12GB` hot cache Inkling tuning.

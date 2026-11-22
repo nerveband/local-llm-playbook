@@ -5,26 +5,36 @@ SCRIPT_PATH="${0:A}"
 SCRIPT_DIR="${SCRIPT_PATH:h}"
 REPO_DIR="${SCRIPT_DIR:h}"
 
-MODEL="inkling-local/inkling"
+INKLING_MODEL="inkling-local/inkling"
+ORNITH_MODEL="omlx-local/Ornith-1.5-35B-A3B-Abliterated-MLX-4bit"
+
+MODEL="$INKLING_MODEL"
 THINK="medium"
+MODEL_EXPLICIT=0
+THINK_EXPLICIT=0
 USE_SUBAGENTS=0
 USE_CONTINUE=1
 USE_RULES=1
 USE_PHASE_TOOL=1
 NO_AGENTS_MD=0
 PRINT_CMD=0
+FORCE_PICK=0
+NO_AUTOSTART=0
+STOP_ALL=0
 
 usage() {
   cat <<'EOF'
 Usage: pi-local [pi-local options] [pi options / prompt...]
 
 Lean Pi launcher for local Apple Silicon oMLX models (Inkling 2 Mini and Ornith).
-Skips global skills, MCP servers, codemode, and cloud extensions to minimize prompt tokens
-and preserve oMLX KV prefix caching.
+When launched interactively without --inkling, --ornith, or --model, shows a live
+model picker and automatically swaps/starts the right local server cleanly within
+64 GiB RAM.
 
 Options:
-  --ornith         Use local Ornith 1.5 35B-A3B model on port 8000 (thinking: high)
-  --model <id>     Override provider/model id (default: inkling-local/inkling)
+  --inkling        Select Inkling 2 Mini directly on port 18089 (skips picker)
+  --ornith         Select Ornith 1.5 35B-A3B directly on port 8000 (thinking: high)
+  --model <id>     Override provider/model id (skips picker)
   --think <level>  Override thinking level: off, minimal, low, medium, high, xhigh, max
   --no-think       Shortcut for --think off
   --subagents      Load isolated pi-subagents extension for multi-step delegation
@@ -32,26 +42,39 @@ Options:
   --no-phase-tool  Skip local phase_handoff tool / /next-phase extension
   --no-rules       Do not append prompts/local-lean-rules.md
   --bare           Skip global AGENTS.md / CLAUDE.md context files for minimum tokens
-  --print-cmd      Print the resolved pi command and exit without starting pi
+  --no-autostart   Do not automatically stop or start local model servers
+  --stop-all       Stop Inkling (port 18089) and quit oMLX.app (port 8000), then exit
+  --pick           Force the interactive model picker even with --print-cmd
+  --print-cmd      Print the resolved pi command and exit without running servers or pi
   -h, --help       Show this help and exit
 
 All remaining flags and arguments pass directly to pi (for example: -p, -c, -r, --no-session).
 
 Examples:
-  pi-local
-  pi-local --bare
-  pi-local --think low -p "Inspect dataset headers"
-  pi-local --subagents
-  pi-local --ornith
+  pi-local                    # Open picker, auto-swap/start server, launch Pi
+  pi-local --bare             # Open picker with minimal 2,376-token prompt mode
+  pi-local --inkling          # Launch Inkling directly without picker
   pi-local --ornith --no-think
+  pi-local --stop-all         # Free all local GPU RAM
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --inkling)
+      MODEL="$INKLING_MODEL"
+      MODEL_EXPLICIT=1
+      if [[ "$THINK_EXPLICIT" == "0" ]]; then
+        THINK="medium"
+      fi
+      shift
+      ;;
     --ornith)
-      MODEL="omlx-local/Ornith-1.5-35B-A3B-Abliterated-MLX-4bit"
-      THINK="high"
+      MODEL="$ORNITH_MODEL"
+      MODEL_EXPLICIT=1
+      if [[ "$THINK_EXPLICIT" == "0" ]]; then
+        THINK="high"
+      fi
       shift
       ;;
     --model)
@@ -60,6 +83,7 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       MODEL="$2"
+      MODEL_EXPLICIT=1
       shift 2
       ;;
     --think)
@@ -68,10 +92,12 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       THINK="$2"
+      THINK_EXPLICIT=1
       shift 2
       ;;
     --no-think)
       THINK="off"
+      THINK_EXPLICIT=1
       shift
       ;;
     --subagents)
@@ -94,6 +120,18 @@ while [[ $# -gt 0 ]]; do
       NO_AGENTS_MD=1
       shift
       ;;
+    --no-autostart)
+      NO_AUTOSTART=1
+      shift
+      ;;
+    --stop-all)
+      STOP_ALL=1
+      shift
+      ;;
+    --pick)
+      FORCE_PICK=1
+      shift
+      ;;
     --print-cmd)
       PRINT_CMD=1
       shift
@@ -112,6 +150,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+IS_PRINT_MODE=0
+for arg in "$@"; do
+  if [[ "$arg" == "-p" || "$arg" == "--print" ]]; then
+    IS_PRINT_MODE=1
+    break
+  fi
+done
+
 port_http_code() {
   local url="$1"
   local code="000"
@@ -122,22 +168,200 @@ port_http_code() {
   print -r -- "$code"
 }
 
+find_inkling_bin() {
+  if command -v inkling-omlx >/dev/null 2>&1; then
+    command -v inkling-omlx
+    return 0
+  fi
+  if [[ -x "$HOME/.local/bin/inkling-omlx" ]]; then
+    print -r -- "$HOME/.local/bin/inkling-omlx"
+    return 0
+  fi
+  return 1
+}
+
+ornith_app_running() {
+  pgrep -f "/Applications/oMLX\.app/Contents/MacOS/oMLX" >/dev/null 2>&1 || pgrep -x "oMLX" >/dev/null 2>&1
+}
+
+stop_inkling() {
+  local bin=""
+  bin=$(find_inkling_bin) || {
+    print -u2 "Error: inkling-omlx launcher not found in PATH or $HOME/.local/bin/inkling-omlx"
+    exit 1
+  }
+  "$bin" stop >&2
+}
+
+start_inkling() {
+  local bin=""
+  bin=$(find_inkling_bin) || {
+    print -u2 "Error: inkling-omlx launcher not found in PATH or $HOME/.local/bin/inkling-omlx"
+    exit 1
+  }
+  "$bin" start >&2
+}
+
+stop_ornith() {
+  osascript -e 'tell application "oMLX" to quit' >/dev/null 2>&1 || true
+  local stopped=0
+  local code=""
+  for _ in {1..40}; do
+    code=$(port_http_code "http://127.0.0.1:8000/v1/models")
+    if [[ "$code" == "000" ]] && ! ornith_app_running; then
+      stopped=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [[ "$stopped" != "1" ]]; then
+    print -u2 "Error: oMLX desktop app on port 8000 did not stop cleanly. Quit oMLX manually first so both models do not compete for 64 GiB RAM."
+    exit 1
+  fi
+}
+
+start_ornith() {
+  if [[ ! -d "/Applications/oMLX.app" ]]; then
+    print -u2 "Error: /Applications/oMLX.app not found."
+    exit 1
+  fi
+  open -g -a /Applications/oMLX.app
+  local ready=0
+  local code=""
+  for _ in {1..90}; do
+    code=$(port_http_code "http://127.0.0.1:8000/v1/models")
+    if [[ "$code" != "000" ]]; then
+      ready=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [[ "$ready" != "1" ]]; then
+    print -u2 "Error: oMLX desktop server did not answer on http://127.0.0.1:8000 within 45 seconds. Open oMLX.app and check that Ornith server startup is enabled."
+    exit 1
+  fi
+}
+
 INKLING_CODE=$(port_http_code "http://127.0.0.1:18089/v1/models")
 ORNITH_CODE=$(port_http_code "http://127.0.0.1:8000/v1/models")
 
-if [[ "$MODEL" == inkling-local/* ]]; then
-  if [[ "$INKLING_CODE" == "000" ]]; then
-    print -u2 "Warning: inkling-omlx is not reachable on http://127.0.0.1:18089 (start it with: inkling-omlx start)"
+INKLING_UP=0
+[[ "$INKLING_CODE" != "000" ]] && INKLING_UP=1
+
+ORNITH_UP=0
+[[ "$ORNITH_CODE" != "000" ]] && ORNITH_UP=1
+
+stop_all_models() {
+  if [[ "$INKLING_UP" == "1" ]]; then
+    print -u2 "Stopping inkling-omlx (port 18089)..."
+    stop_inkling
   fi
-  if [[ "$ORNITH_CODE" != "000" ]]; then
-    print -u2 "Note: oMLX desktop port 8000 is also listening. Unload Ornith before heavy Inkling sessions to protect browser RAM."
+  if [[ "$ORNITH_UP" == "1" ]] || ornith_app_running; then
+    print -u2 "Stopping oMLX desktop app (port 8000)..."
+    stop_ornith
   fi
-elif [[ "$MODEL" == omlx-local/* || "$MODEL" == omlx/* ]]; then
-  if [[ "$ORNITH_CODE" == "000" ]]; then
-    print -u2 "Warning: oMLX desktop server for Ornith is not reachable on http://127.0.0.1:8000 (open oMLX.app to start it)"
+  print -u2 "All local models stopped."
+  exit 0
+}
+
+if [[ "$STOP_ALL" == "1" ]]; then
+  if [[ "$PRINT_CMD" == "1" ]]; then
+    print -r -- "stop-all: would stop inkling-omlx and quit oMLX.app"
+    exit 0
   fi
-  if [[ "$INKLING_CODE" != "000" ]]; then
-    print -u2 "Warning: inkling-omlx is also running on port 18089. Run 'inkling-omlx stop' before using Ornith so both models do not compete for 64 GiB RAM."
+  stop_all_models
+fi
+
+if [[ "$FORCE_PICK" == "1" ]] || { [[ "$MODEL_EXPLICIT" == "0" && "$PRINT_CMD" == "0" && "$IS_PRINT_MODE" == "0" && -t 0 && -t 1 ]]; }; then
+  INKLING_STATUS="stopped"
+  [[ "$INKLING_UP" == "1" ]] && INKLING_STATUS="running"
+
+  ORNITH_STATUS="stopped"
+  [[ "$ORNITH_UP" == "1" ]] && ORNITH_STATUS="running"
+
+  DEFAULT_CHOICE="1"
+  if [[ "$ORNITH_UP" == "1" && "$INKLING_UP" == "0" ]]; then
+    DEFAULT_CHOICE="2"
+  fi
+
+  print -u2 ""
+  print -u2 "pi-local: choose local model"
+  print -u2 "  1) Inkling 2 Mini (128K, medium thinking, port 18089) [$INKLING_STATUS]"
+  print -u2 "  2) Ornith 1.5 35B-A3B (thinking ON, port 8000)        [$ORNITH_STATUS]"
+  print -u2 "  3) Ornith 1.5 35B-A3B (thinking OFF, port 8000)       [$ORNITH_STATUS]"
+  print -u2 "  4) Stop all local models and exit"
+  printf "Select [1-4] (default %s): " "$DEFAULT_CHOICE" >&2
+
+  choice=""
+  IFS= read -r choice || choice=""
+  choice="${choice:-$DEFAULT_CHOICE}"
+
+  case "$choice" in
+    1)
+      MODEL="$INKLING_MODEL"
+      if [[ "$THINK_EXPLICIT" == "0" ]]; then
+        THINK="medium"
+      fi
+      ;;
+    2)
+      MODEL="$ORNITH_MODEL"
+      if [[ "$THINK_EXPLICIT" == "0" ]]; then
+        THINK="high"
+      fi
+      ;;
+    3)
+      MODEL="$ORNITH_MODEL"
+      THINK="off"
+      ;;
+    4)
+      if [[ "$PRINT_CMD" == "1" ]]; then
+        print -r -- "stop-all: would stop inkling-omlx and quit oMLX.app"
+        exit 0
+      fi
+      stop_all_models
+      ;;
+    *)
+      print -u2 "Invalid selection: $choice"
+      exit 2
+      ;;
+  esac
+fi
+
+if [[ "$PRINT_CMD" == "1" || "$NO_AUTOSTART" == "1" ]]; then
+  if [[ "$MODEL" == inkling-local/* ]]; then
+    if [[ "$INKLING_UP" == "0" ]]; then
+      print -u2 "Warning: inkling-omlx is not reachable on http://127.0.0.1:18089 (start it with: inkling-omlx start)"
+    fi
+    if [[ "$ORNITH_UP" != "0" ]]; then
+      print -u2 "Note: oMLX desktop port 8000 is also listening. Unload Ornith before heavy Inkling sessions to protect browser RAM."
+    fi
+  elif [[ "$MODEL" == omlx-local/* || "$MODEL" == omlx/* ]]; then
+    if [[ "$ORNITH_UP" == "0" ]]; then
+      print -u2 "Warning: oMLX desktop server for Ornith is not reachable on http://127.0.0.1:8000 (open oMLX.app to start it)"
+    fi
+    if [[ "$INKLING_UP" != "0" ]]; then
+      print -u2 "Warning: inkling-omlx is also running on port 18089. Run 'inkling-omlx stop' before using Ornith so both models do not compete for 64 GiB RAM."
+    fi
+  fi
+else
+  if [[ "$MODEL" == inkling-local/* ]]; then
+    if [[ "$ORNITH_UP" == "1" ]] || ornith_app_running; then
+      print -u2 "Stopping oMLX desktop app (Ornith) to free RAM for Inkling..."
+      stop_ornith
+    fi
+    if [[ "$INKLING_UP" == "0" ]]; then
+      print -u2 "Starting inkling-omlx (128K + 12GB hot cache)..."
+      start_inkling
+    fi
+  elif [[ "$MODEL" == omlx-local/* || "$MODEL" == omlx/* ]]; then
+    if [[ "$INKLING_UP" == "1" ]]; then
+      print -u2 "Stopping inkling-omlx to free RAM for Ornith..."
+      stop_inkling
+    fi
+    if [[ "$ORNITH_UP" == "0" ]]; then
+      print -u2 "Starting oMLX desktop app for Ornith on port 8000..."
+      start_ornith
+    fi
   fi
 fi
 
