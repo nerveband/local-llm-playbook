@@ -357,7 +357,7 @@ else
       stop_ornith
     fi
     if [[ "$INKLING_UP" == "0" ]]; then
-      print -u2 "Starting inkling-omlx (128K + 12GB hot cache)..."
+      print -u2 "Starting inkling-omlx (128K + 6GB hot cache)..."
       start_inkling
     fi
   elif [[ "$MODEL" == omlx-local/* || "$MODEL" == omlx/* ]]; then

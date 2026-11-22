@@ -6,10 +6,9 @@ Living field guide for keeping local coding and data-analysis sessions fast, acc
 
 ## 1. Hardware and Memory Budget (64 GiB M1 Max)
 
-- **Inkling 2 Mini (`128K` context, `--slots 1`, `--hot-cache-max-size 12GB` on port `18089`):**
+- **Inkling 2 Mini (`128K` context, `--slots 1`, `--hot-cache-max-size 6GB` on port `18089`):**
   - Active model + `64K` KV peak measured `24.39 GB` GPU RAM (`31,712` KV tokens add only `+0.91 GB` across `8` full-attention layers with `1024` sliding-window attention).
-  - Raising `--context` to `131072` (`128K`) adds roughly `1.8 GB` at full context (`~26.2 GB` active), plus up to `12 GB` hot KV prefix cache (`~38 GB` upper ceiling).
-  - Leaves roughly `26 GiB` free for macOS, web browsers, and editors with low swap pressure.
+  - Live `40K` to `46K` sessions sustain `94%` prefix cache efficiency inside ~`4.4 GB` of hot cache. Capping hot cache at `6GB` keeps cache hits high while preventing **oMLX** soft memory pressure (`~29 GB` warning) and prefill throttling when desktop apps use ~`27 GB` on a `64 GiB` Mac.
 - **Ornith 1.5 35B-A3B (`38 GB` resident budget via `splash-1.7.0-m1` + desktop **oMLX** on port `8000`):**
   - Stop Inkling (`inkling-omlx stop`) before opening **oMLX** for Ornith, and unload Ornith before heavy Inkling sessions.
   - Running **either Inkling or Ornith one at a time** keeps browser tabs and desktop apps responsive with zero memory thrashing.
@@ -38,7 +37,7 @@ Instead of letting a single long run hit emergency compaction, let the model swi
 
 - `extensions/local-phase-handoff.ts` gives the model a `phase_handoff` tool that writes `.pi-handoff.md` with the completed summary, key files on disk (`notes.md`, scripts, JSON outputs), and the exact next-phase task.
 - At `40,000` tokens (or `72%` of the window, whichever comes first), a `tool_result` notice whispers once to the model to wrap up `notes.md` and call `phase_handoff` at the next milestone before long-context decode slows down.
-- `extensions/local-context-guard.ts` trims oversized noisy `bash`/`grep`/`find`/`ls` (`>6,000` chars / `120` lines) and `read` (`>20,000` chars / `400` lines) outputs at insertion time while keeping skill/reference/instruction docs (`SKILL.md`, `notes.md`, `PROMPT.md`, `/skills*/`, `/reference/*.md`) intact up to `36,000` chars and spilling trimmed logs to `/tmp/pi-local-tool-logs` so context grows slowly without mutating prior history.
+- `extensions/local-context-guard.ts` trims oversized noisy `bash`/`grep`/`find`/`ls` (`>6,000` chars / `120` lines), explicit `sed -n` line-range slices (`>12,000` chars / `220` lines), and `read` (`>20,000` chars / `400` lines) outputs at insertion time while keeping skill/reference/instruction docs (`SKILL.md`, `notes.md`, `PROMPT.md`, `/skills*/`, `/reference/*.md`) intact up to `36,000` chars and spilling trimmed logs to `/tmp/pi-local-tool-logs` so context grows slowly without mutating prior history.
 - **Two modes controlled by `auto_continue`:**
   - `auto_continue: false` (default): Model writes `.pi-handoff.md`, stops calling tools, and waits so you can inspect deliverables and run `/next-phase` when ready.
   - `auto_continue: true`: When you want hands-free execution across phases, `agent_end` automatically runs `/next-phase` (`ctx.newSession`), opening a fresh clean window with `.pi-handoff.md` as its starting prompt (capped at `3` auto-hops per run for loop safety).
@@ -51,6 +50,7 @@ Hybrid architectures using sliding-window attention and recurrent GDN layers req
 
 - **Keep chat history append-only during a task.** Avoid extensions that rewrite, edit, or delete earlier assistant/tool messages mid-session, because mutating earlier tokens forces a `1` to `2` minute cold re-prefill in **oMLX**.
 - **Keep static system prompts small and stable.** Stripping global MCPs, skills, `codemode`, and cloud tools via `pi-local` drops turn-1 base tokens from `11,328` down to `4,974` (`pi-local`), `2,376` (`pi-local --bare`), or `1,846` (`pi-local --bare --no-phase-tool`).
+- **Pick thinking level per phase, not per turn.** Inkling's `chat_template.jinja` renders `Thinking effort level: <num>` right before user turn 1. Toggling thinking mid-session (`Shift+Tab`) changes an early token, forcing one full re-prefill of the current history (turns after that re-cache at the new level). Launch with `--think low` or `--no-think` for mechanical UI/script passes, and `--think medium` for tricky investigation.
 - **Avoid `/reload` mid-session.** Changing tools or prompts mid-run shifts the prefix and invalidates cached KV blocks.
 
 ---
