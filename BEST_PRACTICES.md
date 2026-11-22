@@ -37,7 +37,8 @@ Mid-turn truncation (`Response was truncated before completion` / `finish_reason
 Instead of letting a single long run hit emergency compaction, let the model switch phases cleanly on disk:
 
 - `extensions/local-phase-handoff.ts` gives the model a `phase_handoff` tool that writes `.pi-handoff.md` with the completed summary, key files on disk (`notes.md`, scripts, JSON outputs), and the exact next-phase task.
-- At `72%` context usage, a `tool_result` notice whispers once to the model to wrap up `notes.md` and call `phase_handoff` at the next milestone before hitting compaction.
+- At `40,000` tokens (or `72%` of the window, whichever comes first), a `tool_result` notice whispers once to the model to wrap up `notes.md` and call `phase_handoff` at the next milestone before long-context decode slows down.
+- `extensions/local-context-guard.ts` trims oversized `bash`/`grep`/`find`/`ls`/`read` outputs at insertion time (keeping head + tail lines and spilling full logs to `/tmp/pi-local-tool-logs`) so context grows slowly without mutating prior history.
 - **Two modes controlled by `auto_continue`:**
   - `auto_continue: false` (default): Model writes `.pi-handoff.md`, stops calling tools, and waits so you can inspect deliverables and run `/next-phase` when ready.
   - `auto_continue: true`: When you want hands-free execution across phases, `agent_end` automatically runs `/next-phase` (`ctx.newSession`), opening a fresh clean window with `.pi-handoff.md` as its starting prompt (capped at `3` auto-hops per run for loop safety).
@@ -58,11 +59,14 @@ Hybrid architectures using sliding-window attention and recurrent GDN layers req
 
 | Tool / Extension | Role on Local oMLX | Prefix-Cache Safe? | Recommendation |
 | --- | --- | --- | --- |
-| `local-phase-handoff.ts` | Self-triggered `phase_handoff` tool + `/next-phase` + `72%` notice | Yes (appends once or starts fresh session) | **Enabled by default in `pi-local`** |
+| `local-phase-handoff.ts` | Self-triggered `phase_handoff` tool + `/next-phase` + `40K` notice | Yes (appends once or starts fresh session) | **Enabled by default in `pi-local`** |
+| `local-context-guard.ts` | Insertion-time head+tail output cap + `/tmp` log spill + failure hints | Yes (edits before insertion, never mutates prior turns) | **Enabled by default in `pi-local`** |
+| `local-omlx-meter.ts` | Per-turn timer + prefill/tool-buffering status + oMLX server stats | Yes | **Enabled by default in `pi-local`** |
 | `pi-handoff` | Manual `/handoff` command into a new session | Yes (fresh session) | **Enabled in `pi-local`** |
 | `pi-continue` | Compacts safely before overflow using a disk ledger | Yes (native cut point) | **Safety net (pass `--no-continue` to skip)** |
 | `pi-subagents` | Isolates noisy exploration into child sessions | Yes (isolated runs) | **Use sequentially (`pi-local --subagents`)** |
-| `pi-tool-repair` / `pi-token-speed` / `@erichll/pi-statusline` | Repairs malformed tool JSON and displays speed metrics | Yes | **Keep enabled in `pi-local`** |
+| `pi-tool-repair` / `@erichll/pi-statusline` | Repairs malformed tool JSON and renders footer status | Yes | **Keep enabled in `pi-local`** |
+| `pi-token-speed` (legacy) | Client chunk counter; undercounts MTP bursts and buffers | Yes | Replaced by `local-omlx-meter.ts` (`--legacy-speed`) |
 | Mid-history pruners (`pi-smart-compact`, `pi-context-kit`, `cprune`) | Deletes old tool outputs from earlier turns | No (breaks prefix from token 0) | Best for cloud APIs, skip for hybrid local **oMLX** models |
 | `rtk` (CLI output compressor) | Compresses verbose shell stdout before entering history | Yes | Good companion for heavy build/test logs |
 
@@ -82,6 +86,6 @@ Note: `pi-continue` emits an npm deprecation notice as of `0.9.3`, so pass `--no
 ## 7. Progressive Disclosure and Disk Memory
 
 1. **Always create `notes.md` early.** Record verified column spellings, key counts, edge cases, generated file paths, and open TODOs. After any `/next-phase`, `/handoff`, or compaction, read `notes.md` first.
-2. **Never dump raw CSVs or giant JSON blobs into stdout.** Write scripts that inspect schema + row counts + `3` to `5` sample rows, compute distributions in Python, and write full outputs to disk (`results.json`, `review.html`). Cap printed summaries under `40` lines.
-3. **Write `.py` files with `write`/`edit` tools.** Avoid multi-hundred-line inline shell heredocs, which clutter context and waste generation tokens if truncated.
-4. **Reset sessions between milestones.** When Phase 1 data analysis is saved on disk, let `phase_handoff` + `/next-phase` move you cleanly to Phase 2 at full local speed.
+2. **Never dump raw CSVs or giant JSON blobs into stdout.** Write scripts that inspect schema + row counts + `3` to `5` sample rows, compute distributions in Python, and write full outputs to disk (`results.json`, `review.html`). Cap printed summaries under `20` lines.
+3. **Write `.py` and `.html` files with `write`/`edit` tools.** Avoid bash heredocs (`<<EOF`), which trigger quoting bugs and waste generation tokens.
+4. **Reset sessions around `40K` tokens.** Lower thinking to `low` or `off` (`Shift+Tab`) during mechanical code-writing phases for peak `~61` to `65 tok/s`, and let `phase_handoff` + `/next-phase` keep phases fast in fresh sessions.

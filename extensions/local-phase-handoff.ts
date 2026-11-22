@@ -5,6 +5,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 
 const HANDOFF_FILENAME = ".pi-handoff.md";
 const HANDOFF_ARCHIVE_FILENAME = ".pi-handoff.last.md";
+const HIGH_CONTEXT_TOKENS = Number(process.env.PI_LOCAL_HANDOFF_TOKENS || 40000);
 const HIGH_CONTEXT_RATIO = 0.72;
 const MAX_AUTO_HANDOFFS = 3;
 
@@ -111,6 +112,7 @@ export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
       "Save a phase boundary summary to .pi-handoff.md so the user or Pi can switch to a clean next-phase session.",
     promptGuidelines: [
       "Before calling phase_handoff, ensure notes.md and deliverable files are written and verified on disk.",
+      "Only call phase_handoff when another phase remains for Pi to run later. If the entire task is done and only human review remains, update notes.md and summarize directly without staging a handoff.",
       "Set auto_continue to false when stopping for user review, or true only when the user requested automatic continuation into the next phase.",
       "Immediately after phase_handoff succeeds, stop calling tools and give a brief 2 to 4 line phase recap.",
     ],
@@ -170,7 +172,8 @@ export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
     }
 
     const ratio = usage.tokens / usage.contextWindow;
-    if (ratio < HIGH_CONTEXT_RATIO) {
+    const hitTokenLimit = HIGH_CONTEXT_TOKENS > 0 && usage.tokens >= HIGH_CONTEXT_TOKENS;
+    if (!hitTokenLimit && ratio < HIGH_CONTEXT_RATIO) {
       return;
     }
 
@@ -181,7 +184,7 @@ export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
         ...event.content,
         {
           type: "text",
-          text: `\n[Context notice: ${pct}% of local context used. Save current facts to notes.md and call phase_handoff at the next clean milestone to move into a fresh session.]`,
+          text: `\n[Local speed notice: ${usage.tokens.toLocaleString()} tokens used (${pct}% of window). Local decode slows above 40K tokens. Update notes.md and call phase_handoff at the next clean milestone if more work remains.]`,
         },
       ],
       ...(event.structuredContent !== undefined ? { structuredContent: event.structuredContent } : {}),
@@ -213,7 +216,7 @@ export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
     }
 
     ctx.ui?.notify?.(
-      "Phase handoff saved to .pi-handoff.md. Review deliverables, then type /next-phase to start in a fresh session.",
+      "Phase handoff saved to .pi-handoff.md (paused for review). Review outputs on disk, then run /next-phase when you want Pi to continue.",
       "info",
     );
   });

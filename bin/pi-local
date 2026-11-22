@@ -16,6 +16,8 @@ USE_SUBAGENTS=0
 USE_CONTINUE=1
 USE_RULES=1
 USE_PHASE_TOOL=1
+USE_CONTEXT_GUARD=1
+USE_LEGACY_SPEED=0
 NO_AGENTS_MD=0
 PRINT_CMD=0
 FORCE_PICK=0
@@ -40,6 +42,8 @@ Options:
   --subagents      Load isolated pi-subagents extension for multi-step delegation
   --no-continue    Skip pi-continue extension (handoff-only workflow)
   --no-phase-tool  Skip local phase_handoff tool / /next-phase extension
+  --no-context-guard Skip local-context-guard output trimmer and failure recovery hints
+  --legacy-speed   Use global pi-token-speed instead of local-omlx-meter
   --no-rules       Do not append prompts/local-lean-rules.md
   --bare           Skip global AGENTS.md / CLAUDE.md context files for minimum tokens
   --no-autostart   Do not automatically stop or start local model servers
@@ -110,6 +114,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-phase-tool)
       USE_PHASE_TOOL=0
+      shift
+      ;;
+    --no-context-guard)
+      USE_CONTEXT_GUARD=0
+      shift
+      ;;
+    --legacy-speed)
+      USE_LEGACY_SPEED=1
       shift
       ;;
     --no-rules)
@@ -389,6 +401,9 @@ add_ext() {
 if [[ "$USE_PHASE_TOOL" == "1" ]]; then
   add_ext "$REPO_DIR/extensions/local-phase-handoff.ts"
 fi
+if [[ "$USE_CONTEXT_GUARD" == "1" ]]; then
+  add_ext "$REPO_DIR/extensions/local-context-guard.ts"
+fi
 
 add_ext "$LOCAL_EXT_ROOT/pi-handoff/extensions/handoff.ts"
 if [[ "$USE_CONTINUE" == "1" ]]; then
@@ -398,7 +413,11 @@ if [[ "$USE_SUBAGENTS" == "1" ]]; then
   add_ext "$LOCAL_EXT_ROOT/pi-subagents/bundle/index.js"
 fi
 
-add_ext "$GLOBAL_EXT_ROOT/pi-token-speed/src/index.ts"
+if [[ "$USE_LEGACY_SPEED" == "1" ]]; then
+  add_ext "$GLOBAL_EXT_ROOT/pi-token-speed/src/index.ts"
+else
+  add_ext "$REPO_DIR/extensions/local-omlx-meter.ts"
+fi
 add_ext "$GLOBAL_EXT_ROOT/@erichll/pi-statusline/src/index.ts"
 add_ext "$GLOBAL_EXT_ROOT/pi-tool-repair/tool-repair.ts"
 
