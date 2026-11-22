@@ -36,13 +36,12 @@ You get an interactive menu with live status:
 
 ```text
 pi-local: choose local model
-  1) Inkling 2 Mini (128K, medium thinking, port 18089) [running]
-  2) Ornith 1.5 35B-A3B (thinking ON, port 8000)        [stopped]
-  3) Ornith 1.5 35B-A3B (thinking OFF, port 8000)       [stopped]
-  4) Stop all local models and exit
+  1) Inkling 2 Mini (128K, port 18089) [running]
+  2) Ornith 1.5 35B-A3B (port 8000)    [stopped]
+  3) Stop all local models and exit
 ```
 
-Picking any option automatically quits the competing model server if active, starts the chosen model server if stopped, waits until ready, and launches Pi cleanly.
+Picking `1` or `2` automatically quits the competing model server if active, starts the chosen model server if stopped, waits until ready, and launches Pi cleanly. Inside Pi, switch thinking anytime with `/thinking` (or `Shift+Tab`).
 
 ### Direct shortcut flags (skip picker)
 
