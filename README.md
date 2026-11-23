@@ -1,12 +1,12 @@
 # local-llm-playbook
 
-Personal playbook, extensions, copy-paste prompt templates, example Pi configurations, and a lean `pi-local` launcher for running local Apple Silicon LLMs with **oMLX** and **Pi**.
+Personal playbook, extensions, copy-paste prompt templates, example Pi configurations, and a lean `pi-local` launcher for running local Apple Silicon LLMs (**Inkling 2 Mini**, **Ornith 1.5**, and **Surogate 3.7 Flash**) with **oMLX**, **Splash**, and **Pi**.
 
 ## Why `pi-local` exists
 
-Global Pi setups often load cloud-oriented packages, skill catalogs, `codemode`, and extra tool definitions that can exceed `11,000` base tokens before your first message. On local Apple Silicon **oMLX** servers, every prefix-cache miss or compaction reset has to re-prefill that entire static prefix on-device.
+Global Pi setups often load cloud-oriented packages, skill catalogs, `codemode`, and extra tool definitions that can exceed `11,000` base tokens before your first message. On local Apple Silicon **oMLX** and **Splash** servers, every prefix-cache miss or compaction reset has to re-prefill that entire static prefix on-device.
 
-`pi-local` handles everything from one command: shows an interactive model picker when launched in a terminal, stops any competing local model so Inkling and Ornith never collide inside `64 GiB` RAM, starts the chosen server if it is stopped, strips heavy cloud tools (`--no-mcp --no-skills --no-extensions --exclude-tools codemode`), loads accurate per-turn local speed telemetry (`local-omlx-meter.ts`), caps oversized tool outputs before they bloat context (`local-context-guard.ts`), and triggers `phase_handoff` + `/next-phase` around `40K` tokens for clean phase transitions.
+`pi-local` handles everything from one command: shows an interactive model picker when launched in a terminal, stops any competing local model so Inkling, Ornith, and Surogate never collide inside `64 GiB` RAM, starts the chosen server if it is stopped, strips heavy cloud tools (`--no-mcp --no-skills --no-extensions --exclude-tools codemode`), loads accurate per-turn local speed telemetry (`local-omlx-meter.ts` supporting both oMLX `usage` and Splash `timings`), caps oversized tool outputs before they bloat context (`local-context-guard.ts`), and triggers `phase_handoff` + `/next-phase` around `40K` tokens for clean phase transitions.
 
 ### Measured baseline prompt reduction (Inkling 2 Mini on M1 Max)
 
@@ -36,12 +36,13 @@ You get an interactive menu with live status:
 
 ```text
 pi-local: choose local model
-  1) Inkling 2 Mini (128K, port 18089) [running]
-  2) Ornith 1.5 35B-A3B (port 8000)    [stopped]
-  3) Stop all local models and exit
+  1) Inkling 2 Mini (128K, port 18089)   [running]
+  2) Ornith 1.5 35B-A3B (port 8000)      [stopped]
+  3) Surogate 3.7 Flash (128K, port 18091) [stopped]
+  4) Stop all local models and exit
 ```
 
-Picking `1` or `2` automatically quits the competing model server if active, starts the chosen model server if stopped, waits until ready, and launches Pi cleanly. Inside Pi, switch thinking anytime with `/thinking` (or `Shift+Tab`).
+Picking `1`, `2`, or `3` automatically quits any competing model server if active, starts the chosen model server (`inkling-omlx`, `oMLX.app`, or `surogate-splash`) if stopped, waits until ready, and launches Pi cleanly. Inside Pi, switch thinking anytime with `/thinking` (or `Shift+Tab`).
 
 ### Direct shortcut flags (skip picker)
 
@@ -51,14 +52,16 @@ pi-local --inkling
 pi-local --inkling --bare --think low
 pi-local --ornith
 pi-local --ornith --no-think
+pi-local --surogate
+pi-local --surogate --bare
 pi-local --inkling --subagents
 
-# Stop both local servers to free all GPU RAM
+# Stop all local servers (ports 18089, 18091, 8000) to free all GPU RAM
 pi-local --stop-all
 
 # Skip auto stop/start or inspect resolved flags without launching
-pi-local --ornith --no-autostart
-pi-local --ornith --print-cmd
+pi-local --surogate --no-autostart
+pi-local --surogate --print-cmd
 ```
 
 ## Self-triggered phase handoffs and local safeguards
@@ -77,12 +80,14 @@ pi-local --ornith --print-cmd
 - [`extensions/local-phase-handoff.ts`](extensions/local-phase-handoff.ts): Self-triggered `phase_handoff` tool, `40K`-token speed notice, and `/next-phase` session switcher.
 - [`scripts/install-local-extensions.sh`](scripts/install-local-extensions.sh): Installs `pi-handoff`, `pi-continue`, and `pi-subagents` into `~/.local/share/pi-local-extensions` and symlinks `pi-local`.
 - [`prompts/local-lean-rules.md`](prompts/local-lean-rules.md): Short system prompt rules for disk-backed state (`notes.md`), batched read-only schema checks, `read`/`edit` over `bash cat`/heredocs, direct `~/.config/skillshare/skills-shared/` path loading, `20`-line stdout cap, and `phase_handoff`.
-- [`configs/pi-models-local.example.json`](configs/pi-models-local.example.json): Local provider definitions (`131072` context, `16384` max output, `thinkingLevelMap`, `compat`).
-- [`configs/pi-settings-local.example.json`](configs/pi-settings-local.example.json): Per-model thinking and compaction overrides for both Inkling (`medium`, `reserveTokens: 24576`) and Ornith (`high`, `reserveTokens: 131072`).
+- [`configs/pi-models-local.example.json`](configs/pi-models-local.example.json): Local provider definitions (`inkling-local` on `18089`, `omlx-local` on `8000`, `surogate-local` on `18091` with `131072` context and `32768` max output).
+- [`configs/pi-settings-local.example.json`](configs/pi-settings-local.example.json): Per-model thinking and compaction overrides for Inkling (`medium`, `reserveTokens: 24576`), Ornith (`high`, `reserveTokens: 131072`), and Surogate (`high`, `reserveTokens: 24576`).
 - [`BEST_PRACTICES.md`](BEST_PRACTICES.md): Apple Silicon memory balance, KV prefix caching, compaction math, Ornith workflow, and subagent concurrency guidelines.
 - [`PROMPTS.md`](PROMPTS.md): Copy-paste prompts for large tabular datasets, refactors, mid-session nudges, and phase transitions.
 
 ## Changelog
+
+- `2026-11-22`: Added Surogate 3.7 Flash (`--surogate`, `surogate-local/surogate` on port `18091`, managed by `surogate-splash` with Splash `1.7.0-m1` + DFlash2 + `bf16` KV/state + `2048` thinking cap + `128K` context), added `--thinking-token-budget 2048` default for Ornith in `splash-no-disk`, added 3-way mutual exclusion to `pi-local`, and added Splash `chunk.timings` extraction to `local-omlx-meter.ts`.
 
 - `2026-11-21`: Added `local-omlx-meter.ts` (accurate per-turn stopwatch, prefill/tool-buffering indicators, and exact oMLX telemetry), `local-context-guard.ts` (prefix-cache-safe tool output trimming + disk log spill + tool-failure recovery hints), lowered `phase_handoff` threshold to `40K` tokens, and tightened `local-lean-rules.md` stdout limit to `20` lines.
 

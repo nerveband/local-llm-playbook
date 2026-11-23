@@ -7,6 +7,7 @@ REPO_DIR="${SCRIPT_DIR:h}"
 
 INKLING_MODEL="inkling-local/inkling"
 ORNITH_MODEL="omlx-local/Ornith-1.5-35B-A3B-Abliterated-MLX-4bit"
+SUROGATE_MODEL="surogate-local/surogate"
 
 MODEL="$INKLING_MODEL"
 THINK="medium"
@@ -28,14 +29,15 @@ usage() {
   cat <<'EOF'
 Usage: pi-local [pi-local options] [pi options / prompt...]
 
-Lean Pi launcher for local Apple Silicon oMLX models (Inkling 2 Mini and Ornith).
-When launched interactively without --inkling, --ornith, or --model, shows a live
+Lean Pi launcher for local Apple Silicon oMLX and Splash models (Inkling, Ornith, Surogate).
+When launched interactively without --inkling, --ornith, --surogate, or --model, shows a live
 model picker and automatically swaps/starts the right local server cleanly within
 64 GiB RAM.
 
 Options:
   --inkling        Select Inkling 2 Mini directly on port 18089 (skips picker)
   --ornith         Select Ornith 1.5 35B-A3B directly on port 8000 (thinking: high)
+  --surogate       Select Surogate 3.7 Flash directly on port 18091 (128K, thinking: high)
   --model <id>     Override provider/model id (skips picker)
   --think <level>  Override thinking level: off, minimal, low, medium, high, xhigh, max
   --no-think       Shortcut for --think off
@@ -47,7 +49,7 @@ Options:
   --no-rules       Do not append prompts/local-lean-rules.md
   --bare           Skip global AGENTS.md / CLAUDE.md context files for minimum tokens
   --no-autostart   Do not automatically stop or start local model servers
-  --stop-all       Stop Inkling (port 18089) and quit oMLX.app (port 8000), then exit
+  --stop-all       Stop Inkling (port 18089), Surogate (port 18091), and quit oMLX.app (port 8000)
   --pick           Force the interactive model picker even with --print-cmd
   --print-cmd      Print the resolved pi command and exit without running servers or pi
   -h, --help       Show this help and exit
@@ -56,9 +58,10 @@ All remaining flags and arguments pass directly to pi (for example: -p, -c, -r, 
 
 Examples:
   pi-local                    # Open picker, auto-swap/start server, launch Pi
-  pi-local --bare             # Open picker with minimal 2,376-token prompt mode
+  pi-local --bare             # Open picker with minimal prompt mode
   pi-local --inkling          # Launch Inkling directly without picker
   pi-local --ornith --no-think
+  pi-local --surogate         # Launch Surogate 3.7 Flash (Splash DFlash2)
   pi-local --stop-all         # Free all local GPU RAM
 EOF
 }
@@ -75,6 +78,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --ornith)
       MODEL="$ORNITH_MODEL"
+      MODEL_EXPLICIT=1
+      if [[ "$THINK_EXPLICIT" == "0" ]]; then
+        THINK="high"
+      fi
+      shift
+      ;;
+    --surogate)
+      MODEL="$SUROGATE_MODEL"
       MODEL_EXPLICIT=1
       if [[ "$THINK_EXPLICIT" == "0" ]]; then
         THINK="high"
@@ -192,6 +203,44 @@ find_inkling_bin() {
   return 1
 }
 
+find_surogate_bin() {
+  if command -v surogate-splash >/dev/null 2>&1; then
+    command -v surogate-splash
+    return 0
+  fi
+  if [[ -x "$HOME/.local/bin/surogate-splash" ]]; then
+    print -r -- "$HOME/.local/bin/surogate-splash"
+    return 0
+  fi
+  return 1
+}
+
+surogate_splash_running() {
+  pgrep -f -- "splash-1\.7\.0-m1 serve .*--port 18091" >/dev/null 2>&1
+}
+
+stop_surogate() {
+  local bin=""
+  if bin=$(find_surogate_bin); then
+    "$bin" stop >&2
+    return 0
+  fi
+  if surogate_splash_running; then
+    pkill -TERM -f -- "splash-1\.7\.0-m1 serve .*--port 18091" 2>/dev/null || true
+    sleep 1
+    pkill -KILL -f -- "splash-1\.7\.0-m1 serve .*--port 18091" 2>/dev/null || true
+  fi
+}
+
+start_surogate() {
+  local bin=""
+  bin=$(find_surogate_bin) || {
+    print -u2 "Error: surogate-splash launcher not found in PATH or $HOME/.local/bin/surogate-splash"
+    exit 1
+  }
+  "$bin" start >&2
+}
+
 ornith_app_running() {
   pgrep -f "/Applications/oMLX\.app/Contents/MacOS/oMLX" >/dev/null 2>&1 || pgrep -x "oMLX" >/dev/null 2>&1
 }
@@ -256,6 +305,7 @@ start_ornith() {
 
 INKLING_CODE=$(port_http_code "http://127.0.0.1:18089/v1/models")
 ORNITH_CODE=$(port_http_code "http://127.0.0.1:8000/v1/models")
+SUROGATE_CODE=$(port_http_code "http://127.0.0.1:18091/v1/models")
 
 INKLING_UP=0
 [[ "$INKLING_CODE" != "000" ]] && INKLING_UP=1
@@ -263,10 +313,17 @@ INKLING_UP=0
 ORNITH_UP=0
 [[ "$ORNITH_CODE" != "000" ]] && ORNITH_UP=1
 
+SUROGATE_UP=0
+[[ "$SUROGATE_CODE" != "000" ]] && SUROGATE_UP=1
+
 stop_all_models() {
   if [[ "$INKLING_UP" == "1" ]]; then
     print -u2 "Stopping inkling-omlx (port 18089)..."
     stop_inkling
+  fi
+  if [[ "$SUROGATE_UP" == "1" ]] || surogate_splash_running; then
+    print -u2 "Stopping surogate-splash (port 18091)..."
+    stop_surogate
   fi
   if [[ "$ORNITH_UP" == "1" ]] || ornith_app_running; then
     print -u2 "Stopping oMLX desktop app (port 8000)..."
@@ -278,7 +335,7 @@ stop_all_models() {
 
 if [[ "$STOP_ALL" == "1" ]]; then
   if [[ "$PRINT_CMD" == "1" ]]; then
-    print -r -- "stop-all: would stop inkling-omlx and quit oMLX.app"
+    print -r -- "stop-all: would stop inkling-omlx, surogate-splash, and quit oMLX.app"
     exit 0
   fi
   stop_all_models
@@ -291,17 +348,23 @@ if [[ "$FORCE_PICK" == "1" ]] || { [[ "$MODEL_EXPLICIT" == "0" && "$PRINT_CMD" =
   ORNITH_STATUS="stopped"
   [[ "$ORNITH_UP" == "1" ]] && ORNITH_STATUS="running"
 
+  SUROGATE_STATUS="stopped"
+  [[ "$SUROGATE_UP" == "1" ]] && SUROGATE_STATUS="running"
+
   DEFAULT_CHOICE="1"
-  if [[ "$ORNITH_UP" == "1" && "$INKLING_UP" == "0" ]]; then
+  if [[ "$SUROGATE_UP" == "1" && "$INKLING_UP" == "0" && "$ORNITH_UP" == "0" ]]; then
+    DEFAULT_CHOICE="3"
+  elif [[ "$ORNITH_UP" == "1" && "$INKLING_UP" == "0" && "$SUROGATE_UP" == "0" ]]; then
     DEFAULT_CHOICE="2"
   fi
 
   print -u2 ""
   print -u2 "pi-local: choose local model"
-  print -u2 "  1) Inkling 2 Mini (128K, port 18089) [$INKLING_STATUS]"
-  print -u2 "  2) Ornith 1.5 35B-A3B (port 8000)    [$ORNITH_STATUS]"
-  print -u2 "  3) Stop all local models and exit"
-  printf "Select [1-3] (default %s): " "$DEFAULT_CHOICE" >&2
+  print -u2 "  1) Inkling 2 Mini (128K, port 18089)   [$INKLING_STATUS]"
+  print -u2 "  2) Ornith 1.5 35B-A3B (port 8000)      [$ORNITH_STATUS]"
+  print -u2 "  3) Surogate 3.7 Flash (128K, port 18091) [$SUROGATE_STATUS]"
+  print -u2 "  4) Stop all local models and exit"
+  printf "Select [1-4] (default %s): " "$DEFAULT_CHOICE" >&2
 
   choice=""
   IFS= read -r choice || choice=""
@@ -321,8 +384,14 @@ if [[ "$FORCE_PICK" == "1" ]] || { [[ "$MODEL_EXPLICIT" == "0" && "$PRINT_CMD" =
       fi
       ;;
     3)
+      MODEL="$SUROGATE_MODEL"
+      if [[ "$THINK_EXPLICIT" == "0" ]]; then
+        THINK="high"
+      fi
+      ;;
+    4)
       if [[ "$PRINT_CMD" == "1" ]]; then
-        print -r -- "stop-all: would stop inkling-omlx and quit oMLX.app"
+        print -r -- "stop-all: would stop inkling-omlx, surogate-splash, and quit oMLX.app"
         exit 0
       fi
       stop_all_models
@@ -342,12 +411,28 @@ if [[ "$PRINT_CMD" == "1" || "$NO_AUTOSTART" == "1" ]]; then
     if [[ "$ORNITH_UP" != "0" ]]; then
       print -u2 "Note: oMLX desktop port 8000 is also listening. Unload Ornith before heavy Inkling sessions to protect browser RAM."
     fi
+    if [[ "$SUROGATE_UP" != "0" ]] || surogate_splash_running; then
+      print -u2 "Warning: surogate-splash is also running on port 18091. Run 'surogate-splash stop' so both models do not compete for 64 GiB RAM."
+    fi
+  elif [[ "$MODEL" == surogate-local/* ]]; then
+    if [[ "$SUROGATE_UP" == "0" ]]; then
+      print -u2 "Warning: surogate-splash is not reachable on http://127.0.0.1:18091 (start it with: surogate-splash start)"
+    fi
+    if [[ "$INKLING_UP" != "0" ]]; then
+      print -u2 "Warning: inkling-omlx is also running on port 18089. Run 'inkling-omlx stop' before using Surogate so both models do not compete for 64 GiB RAM."
+    fi
+    if [[ "$ORNITH_UP" != "0" ]] || ornith_app_running; then
+      print -u2 "Warning: oMLX desktop port 8000 is also listening. Quit oMLX.app before using Surogate so both models do not compete for 64 GiB RAM."
+    fi
   elif [[ "$MODEL" == omlx-local/* || "$MODEL" == omlx/* ]]; then
     if [[ "$ORNITH_UP" == "0" ]]; then
       print -u2 "Warning: oMLX desktop server for Ornith is not reachable on http://127.0.0.1:8000 (open oMLX.app to start it)"
     fi
     if [[ "$INKLING_UP" != "0" ]]; then
       print -u2 "Warning: inkling-omlx is also running on port 18089. Run 'inkling-omlx stop' before using Ornith so both models do not compete for 64 GiB RAM."
+    fi
+    if [[ "$SUROGATE_UP" != "0" ]] || surogate_splash_running; then
+      print -u2 "Warning: surogate-splash is also running on port 18091. Run 'surogate-splash stop' before using Ornith so both models do not compete for 64 GiB RAM."
     fi
   fi
 else
@@ -356,14 +441,35 @@ else
       print -u2 "Stopping oMLX desktop app (Ornith) to free RAM for Inkling..."
       stop_ornith
     fi
+    if [[ "$SUROGATE_UP" == "1" ]] || surogate_splash_running; then
+      print -u2 "Stopping surogate-splash to free RAM for Inkling..."
+      stop_surogate
+    fi
     if [[ "$INKLING_UP" == "0" ]]; then
       print -u2 "Starting inkling-omlx (128K + 6GB hot cache)..."
       start_inkling
+    fi
+  elif [[ "$MODEL" == surogate-local/* ]]; then
+    if [[ "$INKLING_UP" == "1" ]]; then
+      print -u2 "Stopping inkling-omlx to free RAM for Surogate..."
+      stop_inkling
+    fi
+    if [[ "$ORNITH_UP" == "1" ]] || ornith_app_running; then
+      print -u2 "Stopping oMLX desktop app (Ornith) to free RAM for Surogate..."
+      stop_ornith
+    fi
+    if [[ "$SUROGATE_UP" == "0" ]]; then
+      print -u2 "Starting surogate-splash (128K + bf16 KV/state + thinking cap)..."
+      start_surogate
     fi
   elif [[ "$MODEL" == omlx-local/* || "$MODEL" == omlx/* ]]; then
     if [[ "$INKLING_UP" == "1" ]]; then
       print -u2 "Stopping inkling-omlx to free RAM for Ornith..."
       stop_inkling
+    fi
+    if [[ "$SUROGATE_UP" == "1" ]] || surogate_splash_running; then
+      print -u2 "Stopping surogate-splash to free RAM for Ornith..."
+      stop_surogate
     fi
     if [[ "$ORNITH_UP" == "0" ]]; then
       print -u2 "Starting oMLX desktop app for Ornith on port 8000..."

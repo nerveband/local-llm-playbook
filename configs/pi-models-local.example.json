@@ -71,6 +71,40 @@
           }
         }
       ]
+    },
+    "surogate-local": {
+      "baseUrl": "http://127.0.0.1:18091/v1",
+      "api": "openai-completions",
+      "apiKey": "local-placeholder",
+      "models": [
+        {
+          "id": "surogate",
+          "name": "Surogate 3.7 Flash (Splash DFlash2)",
+          "reasoning": true,
+          "input": [
+            "text"
+          ],
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "contextWindow": 131072,
+          "maxTokens": 32768,
+          "compat": {
+            "thinkingFormat": "qwen-chat-template",
+            "maxTokensField": "max_tokens"
+          },
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": "high"
+          }
+        }
+      ]
     }
   }
 }

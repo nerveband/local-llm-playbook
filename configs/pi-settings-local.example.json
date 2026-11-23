@@ -1,7 +1,8 @@
 {
   "modelThinkingLevels": {
     "inkling-local/inkling": "medium",
-    "omlx-local/Ornith-1.5-35B-A3B-Abliterated-MLX-4bit": "high"
+    "omlx-local/Ornith-1.5-35B-A3B-Abliterated-MLX-4bit": "high",
+    "surogate-local/surogate": "high"
   },
   "compaction": {
     "modelOverrides": {
@@ -11,6 +12,10 @@
       },
       "omlx-local/Ornith-1.5-35B-A3B-Abliterated-MLX-4bit": {
         "reserveTokens": 131072,
+        "keepRecentTokens": 12000
+      },
+      "surogate-local/surogate": {
+        "reserveTokens": 24576,
         "keepRecentTokens": 12000
       }
     }

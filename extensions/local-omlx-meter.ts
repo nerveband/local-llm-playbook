@@ -93,8 +93,50 @@ export function resolveServerOrigin(model: ExtensionContext["model"]): string | 
   }
   const provider = String(model?.provider || "").toLowerCase();
   if (provider === "inkling-local") return "http://127.0.0.1:18089";
+  if (provider === "surogate-local") return "http://127.0.0.1:18091";
   if (provider === "omlx-local" || provider === "omlx") return "http://127.0.0.1:8000";
   return null;
+}
+
+function mergeDefinedStats(
+  base: ServerTurnStats | null,
+  incoming: ServerTurnStats | null,
+): ServerTurnStats | null {
+  if (!incoming) return base;
+  const merged: ServerTurnStats = { ...(base ?? {}) };
+  for (const [k, v] of Object.entries(incoming)) {
+    if (v !== undefined) {
+      (merged as Record<string, number>)[k] = v as number;
+    }
+  }
+  return Object.keys(merged).length > 0 ? merged : null;
+}
+
+export function extractServerStatsFromTimings(timings: unknown): ServerTurnStats | null {
+  if (!timings || typeof timings !== "object") return null;
+  const t = timings as Record<string, unknown>;
+  const num = (key: string): number | undefined => {
+    const val = t[key];
+    return typeof val === "number" && Number.isFinite(val) ? val : undefined;
+  };
+  const promptMs = num("prompt_ms");
+  const predMs = num("predicted_ms");
+  let totalTimeSec: number | undefined;
+  if (promptMs !== undefined || predMs !== undefined) {
+    totalTimeSec = Math.max(0, (promptMs ?? 0) + (predMs ?? 0)) / 1000;
+  }
+  const stats: ServerTurnStats = {
+    genTps: num("predicted_per_second"),
+    prefillTps: num("prompt_per_second"),
+    ttftSec: promptMs !== undefined && promptMs >= 0 ? promptMs / 1000 : undefined,
+    genDurationSec: predMs !== undefined && predMs > 0 ? predMs / 1000 : undefined,
+    totalTimeSec,
+    completionTokens: num("predicted_n"),
+    promptTokens: num("prompt_n"),
+    cachedTokens: num("cache_n"),
+  };
+  const hasAny = Object.values(stats).some((v) => v !== undefined);
+  return hasAny ? stats : null;
 }
 
 export function extractServerStatsFromUsage(usage: unknown): ServerTurnStats | null {
@@ -382,13 +424,10 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
   pi.on("provider_stream_event", (event) => {
     if (!event || !event.data || typeof event.data !== "object") return;
     const chunk = event.data as Record<string, unknown>;
-    const extracted = extractServerStatsFromUsage(chunk.usage);
-    if (extracted) {
-      turnServerStats = {
-        ...turnServerStats,
-        ...extracted,
-      };
-    }
+    const fromUsage = extractServerStatsFromUsage(chunk.usage);
+    const fromTimings = extractServerStatsFromTimings(chunk.timings);
+    turnServerStats = mergeDefinedStats(turnServerStats, fromUsage);
+    turnServerStats = mergeDefinedStats(turnServerStats, fromTimings);
   });
 
   pi.on("message_update", (event, ctx) => {
