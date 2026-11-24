@@ -623,6 +623,53 @@ test("empirical microtest fixes: happy-dom textContent=0, auto-invoke eval funct
     const parsed = JSON.parse(raw.trim().split("\n").pop());
     assert.equal(parsed.ok, true);
     assert.equal(parsed.custom?.val, "0");
+
+    assert.equal(isWorkspaceScratchScript("write", { path: "_check.mjs" }), "_check.mjs");
+
+    const multiJs = path.join(dir, "multi_check.js");
+    fs.writeFileSync(
+      multiJs,
+      [
+        "const badgeText = document.getElementById('badge').textContent;",
+        "await new Promise((r) => setTimeout(r, 15));",
+        "return { ok: badgeText === '0', asyncRan: true };",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    const domSemi = JSON.parse(
+      execFileSync(path.join(REPO_DIR, "bin/pi-verify-ui"), [html, "--dom", "--eval-js", "async () => ({ ok: true, kind: 'semi' });"], {
+        encoding: "utf-8",
+      }).trim().split("\n").pop(),
+    );
+    assert.equal(domSemi.ok, true);
+    assert.equal(domSemi.custom?.kind, "semi");
+
+    const domMulti = JSON.parse(
+      execFileSync(path.join(REPO_DIR, "bin/pi-verify-ui"), [html, "--dom", "--eval-js", multiJs], {
+        encoding: "utf-8",
+      }).trim().split("\n").pop(),
+    );
+    assert.equal(domMulti.ok, true);
+    assert.equal(domMulti.custom?.asyncRan, true);
+
+    const cdpMulti = JSON.parse(
+      execFileSync(path.join(REPO_DIR, "bin/pi-verify-ui"), [html, "--eval-js", multiJs], {
+        encoding: "utf-8",
+      }).trim().split("\n").pop(),
+    );
+    assert.equal(cdpMulti.ok, true);
+    assert.equal(cdpMulti.mode, "chrome-cdp");
+    assert.equal(cdpMulti.custom?.asyncRan, true);
+
+    const cdpStdin = JSON.parse(
+      execFileSync(path.join(REPO_DIR, "bin/pi-verify-ui"), [html, "--eval-js", "-"], {
+        input: "(() => ({ ok: true, viaStdin: `tpl_${1 + 1}` }))();",
+        encoding: "utf-8",
+      }).trim().split("\n").pop(),
+    );
+    assert.equal(cdpStdin.ok, true);
+    assert.equal(cdpStdin.custom?.viaStdin, "tpl_2");
   });
 });
 

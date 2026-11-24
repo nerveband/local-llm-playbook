@@ -16,13 +16,13 @@ function printHelp() {
       "or fast in-process Node happy-dom (--dom / --fast) with zero external daemons.",
       "",
       "Options:",
-      "  --dom, --fast          Run fast virtual DOM verification in Node happy-dom (<200ms)",
-      "  --eval-js <expr|file>  JS expression or file whose result/ok field is checked",
-      "  --expect-min-text <n>  Minimum visible body innerText length (default: 40)",
-      "  --screenshot <path>    Save PNG screenshot to <path> (Chrome CDP mode)",
-      "  --timeout <ms>         Timeout in milliseconds (default: 15000)",
-      "  --session <name>       Accepted for CLI compatibility (no-op)",
-      "  -h, --help             Show help",
+      "  --dom, --fast              Run fast virtual DOM verification in Node happy-dom (<200ms)",
+      "  --eval-js <expr|file|->    JS expression, .js file, or '-' (stdin); supports async/await and trailing ';'",
+      "  --expect-min-text <n>      Minimum visible body innerText length (default: 40)",
+      "  --screenshot <path>        Save PNG screenshot to <path> (Chrome CDP mode)",
+      "  --timeout <ms>             Timeout in milliseconds (default: 15000)",
+      "  --session <name>           Accepted for CLI compatibility (no-op)",
+      "  -h, --help                 Show help",
       "",
     ].join("\n"),
   );
@@ -97,6 +97,9 @@ function resolveTarget(target) {
 
 function readCustomExpr(evalJsArg) {
   if (!evalJsArg) return "null";
+  if (evalJsArg === "-") {
+    return fs.readFileSync(0, "utf-8");
+  }
   try {
     if (fs.existsSync(evalJsArg) && fs.statSync(evalJsArg).isFile()) {
       return fs.readFileSync(evalJsArg, "utf-8");
@@ -105,6 +108,29 @@ function readCustomExpr(evalJsArg) {
     // Treat as raw JS expression if stat fails.
   }
   return evalJsArg;
+}
+
+function buildEvalSnippet(customExpr) {
+  const encoded = JSON.stringify(String(customExpr || ""));
+  return [
+    "(async () => {",
+    "  const src = " + encoded + ".trim();",
+    '  if (!src || src === "null") return null;',
+    '  const noSemi = src.replace(/;+\\s*$/, "");',
+    "  const AsyncFn = Object.getPrototypeOf(async function () {}).constructor;",
+    "  let fn;",
+    "  try {",
+    '    fn = new AsyncFn("return (" + noSemi + ");");',
+    "  } catch {",
+    "    fn = new AsyncFn(src);",
+    "  }",
+    "  let res = await fn();",
+    '  if (typeof res === "function") {',
+    "    res = await res();",
+    "  }",
+    "  return res;",
+    "})()",
+  ].join("\n");
 }
 
 function loadHappyDom() {
@@ -181,6 +207,7 @@ function buildResult({
 }
 
 function buildDomInspectionScript(minText, customExpr) {
+  const evalSnippet = buildEvalSnippet(customExpr);
   return `(async () => {
   const doc = document;
   const textLen = (doc.body?.innerText || doc.body?.textContent || "").trim().length;
@@ -210,10 +237,7 @@ function buildDomInspectionScript(minText, customExpr) {
       }
     }
   }
-  let custom = await Promise.resolve(${customExpr});
-  if (typeof custom === "function") {
-    custom = await Promise.resolve(custom());
-  }
+  let custom = await ` + evalSnippet + `;
   return {
     title: doc.title || "",
     url: location.href,
@@ -308,11 +332,7 @@ async function runDomMode(resolved, opts, customExpr) {
     let custom = null;
     if (opts.evalJs) {
       try {
-        let evalVal = win.eval(`(${customExpr})`);
-        if (typeof evalVal === "function") {
-          evalVal = evalVal();
-        }
-        custom = await Promise.resolve(evalVal);
+        custom = await win.eval(buildEvalSnippet(customExpr));
       } catch (err) {
         pageErrors.push(String(err?.message || err));
       }

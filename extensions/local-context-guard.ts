@@ -158,7 +158,7 @@ const NOTES_APPEND_MAX_CHARS = Number(process.env.PI_LOCAL_NOTES_HEREDOC_CHARS |
 const HARD_PYTHON_INLINE_CHARS = Number(process.env.PI_LOCAL_HARD_PYTHON_INLINE_CHARS || 800);
 const HARD_PYTHON_PROBE_STREAK = Number(process.env.PI_LOCAL_HARD_PYTHON_STREAK || 5);
 const INLINE_PROBE_STREAK_WARN = Number(process.env.PI_LOCAL_INLINE_PROBE_WARN || 3);
-const WORKSPACE_SCRATCH_RE = /^_(?:explore|probe|debug|verify|test)[a-z0-9_-]*\.(?:py|js|mjs|cjs)$/i;
+const WORKSPACE_SCRATCH_RE = /^_(?:explore|probe|debug|verify|test|check)[a-z0-9_-]*\.(?:py|js|mjs|cjs)$/i;
 
 export function isWorkspaceScratchScript(toolName: string, input: Record<string, unknown> | undefined): string | null {
   if (toolName !== "write" || !input) return null;
@@ -1835,7 +1835,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
           });
           if (cliFamily === "pi-verify-ui") {
             hints.push(
-              `[CLI batching hint: ${famCount} pi-verify-ui calls in this session. Batch all remaining UI assertions into 1 compound --eval-js IIFE (or a single .js file passed to --eval-js) and run 1 final real-Chrome check without --dom.]`,
+              `[CLI batching hint: ${famCount} pi-verify-ui calls in this session. Put all remaining async/sync UI assertions in 1 .js file (supports multi-statement code, trailing ';', and await) passed via --eval-js check.js and run 1 final real-Chrome check without --dom.]`,
             );
           } else if (cliFamily === "agent-browser" || cliFamily === "browser-use") {
             hints.push(
