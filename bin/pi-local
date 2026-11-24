@@ -14,7 +14,6 @@ THINK="medium"
 MODEL_EXPLICIT=0
 THINK_EXPLICIT=0
 USE_SUBAGENTS=0
-USE_CONTINUE=0
 USE_RULES=1
 USE_PHASE_TOOL=1
 USE_CONTEXT_GUARD=1
@@ -42,8 +41,6 @@ Options:
   --think <level>  Override thinking level: off, minimal, low, medium, high, xhigh, max
   --no-think       Shortcut for --think off
   --subagents      Load isolated pi-subagents extension for multi-step delegation
-  --continue       Load deprecated pi-continue extension (disabled by default)
-  --no-continue    Skip pi-continue extension (default; handoff-only workflow)
   --no-phase-tool  Skip local phase_handoff tool / /next-phase extension
   --no-context-guard Skip local-context-guard output trimmer and failure recovery hints
   --legacy-speed   Use global pi-token-speed instead of local-omlx-meter
@@ -118,14 +115,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --subagents)
       USE_SUBAGENTS=1
-      shift
-      ;;
-    --continue)
-      USE_CONTINUE=1
-      shift
-      ;;
-    --no-continue)
-      USE_CONTINUE=0
       shift
       ;;
     --no-phase-tool)
@@ -517,9 +506,6 @@ if [[ "$USE_CONTEXT_GUARD" == "1" ]]; then
 fi
 
 add_ext "$LOCAL_EXT_ROOT/pi-handoff/extensions/handoff.ts"
-if [[ "$USE_CONTINUE" == "1" ]]; then
-  add_ext "$LOCAL_EXT_ROOT/pi-continue/extensions/continue/index.ts"
-fi
 if [[ "$USE_SUBAGENTS" == "1" ]]; then
   add_ext "$LOCAL_EXT_ROOT/pi-subagents/bundle/index.js"
 fi

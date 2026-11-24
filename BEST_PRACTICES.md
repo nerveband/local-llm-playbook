@@ -93,14 +93,12 @@ Hybrid architectures using sliding-window attention and recurrent GDN layers req
 | `local-context-guard.ts` | Insertion-time output cap + `/tmp` log spill + `sha256` loop guard + heredoc/error hints | Yes (edits before insertion, never mutates prior turns) | **Enabled by default in `pi-local`** |
 | `local-omlx-meter.ts` | Per-turn timer + prefill/tool-buffering status + oMLX server stats | Yes | **Enabled by default in `pi-local`** |
 | `pi-handoff` | Manual `/handoff` command into a new session | Yes (fresh session) | **Enabled in `pi-local`** |
-| `pi-continue` | Compacts safely before overflow using a disk ledger | Yes (native cut point) | Disabled by default in `pi-local` (deprecated `0.9.3`; aborts active local turns around `50%` / `65K` context before native compaction). Pass `--continue` only if explicitly wanted. |
+| `pi-continue` | Compacts safely before overflow using a disk ledger | Yes (native cut point) | Removed (deprecated `0.9.3`; aborted active local turns around `50%` / `65K` context). Use `local-phase-handoff.ts` + `/handoff` instead. |
 | `pi-subagents` | Isolates noisy exploration into child sessions | Yes (isolated runs) | **Use sequentially (`pi-local --subagents`)** |
 | `pi-tool-repair` / `@erichll/pi-statusline` | Repairs malformed tool JSON and renders footer status | Yes | **Keep enabled in `pi-local`** |
 | `pi-token-speed` (legacy) | Client chunk counter; undercounts MTP bursts and buffers | Yes | Replaced by `local-omlx-meter.ts` (`--legacy-speed`) |
 | Mid-history pruners (`pi-smart-compact`, `pi-context-kit`, `cprune`) | Deletes old tool outputs from earlier turns | No (breaks prefix from token 0) | Best for cloud APIs, skip for hybrid local **oMLX** models |
 | `rtk` (CLI output compressor) | Compresses verbose shell stdout before entering history | Yes | Good companion for heavy build/test logs |
-
-Note: `pi-continue` emits an npm deprecation notice as of `0.9.3`, so pass `--no-continue` to `pi-local` if you prefer `local-phase-handoff.ts` + `/handoff` alone.
 
 ---
 
