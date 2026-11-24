@@ -438,6 +438,9 @@ stop_all_models() {
     print -u2 "Stopping oMLX desktop app (port 8000)..."
     stop_ornith
   fi
+  if pgrep -f -- "agent-browser-darwin-arm64" >/dev/null 2>&1; then
+    pkill -TERM -f -- "agent-browser-darwin-arm64" 2>/dev/null || true
+  fi
   print -u2 "All local models stopped."
   exit 0
 }

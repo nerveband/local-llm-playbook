@@ -158,6 +158,15 @@ const NOTES_APPEND_MAX_CHARS = Number(process.env.PI_LOCAL_NOTES_HEREDOC_CHARS |
 const HARD_PYTHON_INLINE_CHARS = Number(process.env.PI_LOCAL_HARD_PYTHON_INLINE_CHARS || 800);
 const HARD_PYTHON_PROBE_STREAK = Number(process.env.PI_LOCAL_HARD_PYTHON_STREAK || 5);
 const INLINE_PROBE_STREAK_WARN = Number(process.env.PI_LOCAL_INLINE_PROBE_WARN || 3);
+const WORKSPACE_SCRATCH_RE = /^_(?:explore|probe|debug|verify|test)[a-z0-9_-]*\.(?:py|js|mjs|cjs)$/i;
+
+export function isWorkspaceScratchScript(toolName: string, input: Record<string, unknown> | undefined): string | null {
+  if (toolName !== "write" || !input) return null;
+  const p = String(input.path ?? input.file_path ?? "").trim();
+  if (!p) return null;
+  const base = path.basename(p);
+  return WORKSPACE_SCRATCH_RE.test(base) ? base : null;
+}
 
 function isTmpScratchPythonWrite(toolName: string, input: Record<string, unknown> | undefined): boolean {
   if (toolName !== "write" || !input) return false;
@@ -214,7 +223,10 @@ function isShellReadProbe(toolName: string, input: Record<string, unknown> | und
 const MAX_REPAIR_FILE_BYTES = 2_097_152;
 const SLOW_BASH_MS = Number(process.env.PI_LOCAL_SLOW_BASH_MS || 60000);
 const MAX_PREMATURE_RETRIES = 2;
-const AGENT_BROWSER_EVAL_BATCH_NUDGE = Number(process.env.PI_LOCAL_AB_EVAL_NUDGE || 6);
+const AGENT_BROWSER_EVAL_BATCH_NUDGE = Number(process.env.PI_LOCAL_AB_EVAL_NUDGE || 3);
+const SHORT_BASH_STREAK_NUDGE = Number(process.env.PI_LOCAL_SHORT_BASH_NUDGE || 4);
+const HASHLINE_EDIT_EXAMPLE =
+  '{"path": "file.py", "edits": [{"op": "replace", "pos": "12#ZP", "lines": ["..."]}]}';
 const VERIFY_SCRIPT_CMD_RE =
   /(?:^|[\s/])(?:_?verify|verify_|_?harness|test_)[a-zA-Z0-9_.-]*\.(?:js|mjs|cjs|py)\b/i;
 
@@ -274,6 +286,115 @@ function resolveWorkspacePath(filePath: string, cwd: string): string | null {
   return path.isAbsolute(trimmed) ? trimmed : path.resolve(cwd, trimmed);
 }
 
+function closeUnbalancedJsonContainers(src: string): string {
+  const stack: string[] = [];
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+    if (inStr) {
+      if (esc) {
+        esc = false;
+      } else if (ch === "\\") {
+        esc = true;
+      } else if (ch === '"') {
+        inStr = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+    } else if (ch === "[") {
+      stack.push("]");
+    } else if (ch === "{") {
+      stack.push("}");
+    } else if ((ch === "]" || ch === "}") && stack.length > 0 && stack[stack.length - 1] === ch) {
+      stack.pop();
+    }
+  }
+  if (inStr || stack.length === 0) return src;
+  return src.replace(/,\s*$/, "") + stack.reverse().join("");
+}
+
+function normalizeRelaxedJsonString(src: string): string {
+  let out = "";
+  let mode: "code" | "double" | "single" = "code";
+  let esc = false;
+
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+    if (mode === "double") {
+      if (esc) {
+        esc = false;
+        if (ch === "'") {
+          out += "'";
+        } else {
+          out += "\\" + ch;
+        }
+        continue;
+      }
+      if (ch === "\\") {
+        esc = true;
+        continue;
+      }
+      if (ch === '"') {
+        mode = "code";
+      }
+      out += ch;
+      continue;
+    }
+
+    if (mode === "single") {
+      if (esc) {
+        esc = false;
+        if (ch === "'") {
+          out += "'";
+        } else if (ch === '"') {
+          out += '\\"';
+        } else {
+          out += "\\" + ch;
+        }
+        continue;
+      }
+      if (ch === "\\") {
+        esc = true;
+        continue;
+      }
+      if (ch === "'") {
+        mode = "code";
+        out += '"';
+      } else if (ch === '"') {
+        out += '\\"';
+      } else if (ch === "\n") {
+        out += "\\n";
+      } else if (ch === "\r") {
+        out += "\\r";
+      } else {
+        out += ch;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      mode = "double";
+      out += ch;
+    } else if (ch === "'") {
+      mode = "single";
+      out += '"';
+    } else {
+      out += ch;
+    }
+  }
+  return closeUnbalancedJsonContainers(out.replace(/,\s*([}\]])/g, "$1"));
+}
+
+function normalizeDoubleEscapedJsonQuotes(src: string): string {
+  // Repair over-escaped `\\"` / `\\\\"` inside JSON strings where the quote is not closing a JSON token.
+  return src
+    .replace(/\\\\+"/g, '\\"')
+    .replace(/\\"(?=[^\s,}\]:])/g, '\\"');
+}
+
 function tryParseJsonObjectOrArray(raw: string): unknown {
   let cleaned = raw.trim();
   if (!cleaned) return null;
@@ -281,14 +402,33 @@ function tryParseJsonObjectOrArray(raw: string): unknown {
   if (fence) {
     cleaned = fence[1].trim();
   }
-  const attempts = [cleaned, cleaned.replace(/,\s*([}\]])/g, "$1")];
+
+  const baseCandidates = [cleaned, cleaned.replace(/,\s*([}\]])/g, "$1")];
   if (cleaned.includes('"""')) {
     const fixedTriple = cleaned
       .replace(/:\s*"""([\s\S]*?)"""(?=\s*[,}\]])/g, (_m, inner: string) => `: ${JSON.stringify(inner)}`)
       .replace(/,\s*([}\]])/g, "$1");
-    attempts.push(fixedTriple);
+    baseCandidates.push(fixedTriple);
   }
+
+  const attempts: string[] = [];
+  for (const base of baseCandidates) {
+    attempts.push(base);
+    attempts.push(closeUnbalancedJsonContainers(base));
+    const relaxed = normalizeRelaxedJsonString(base);
+    if (relaxed !== base) attempts.push(relaxed);
+    if (/\\+"/.test(base)) {
+      const unescaped = normalizeDoubleEscapedJsonQuotes(base);
+      attempts.push(unescaped);
+      attempts.push(closeUnbalancedJsonContainers(unescaped));
+      attempts.push(normalizeRelaxedJsonString(unescaped));
+    }
+  }
+
+  const seen = new Set<string>();
   for (const candidate of attempts) {
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
     try {
       return JSON.parse(candidate);
     } catch {
@@ -974,12 +1114,16 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
   let consecutiveVerifyScriptErrors = 0;
   let consecutiveAgentBrowserEvals = 0;
   let slowBashCount = 0;
+  let consecutiveShortBash = 0;
+  let piVerifyUiRan = false;
   let hadToolCallsInSession = false;
   let consecutivePrematureRetries = 0;
   let lastAssistantSnapshot: Omit<AssistantTurnSnapshot, "hadToolCallsInSession"> | null = null;
   const bashStartTimes = new Map<string, number>();
   const baselineLintCounts = new Map<string, number>();
   const fileFailureStreak = new Map<string, number>();
+  const fileReadCounts = new Map<string, number>();
+  const workspaceScratchFiles = new Set<string>();
   const openBrowserSessions = new Set<string>();
 
   function resetAllCounters(): void {
@@ -992,11 +1136,15 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     consecutiveVerifyScriptErrors = 0;
     consecutiveAgentBrowserEvals = 0;
     slowBashCount = 0;
+    consecutiveShortBash = 0;
+    piVerifyUiRan = false;
     consecutivePrematureRetries = 0;
     lastAssistantSnapshot = null;
     bashStartTimes.clear();
     baselineLintCounts.clear();
     fileFailureStreak.clear();
+    fileReadCounts.clear();
+    workspaceScratchFiles.clear();
   }
 
   pi.on("session_start", () => {
@@ -1124,13 +1272,25 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       };
     }
 
+    const scratchName = isWorkspaceScratchScript(toolName, input);
+    if (scratchName && workspaceScratchFiles.size >= 2 && !workspaceScratchFiles.has(scratchName)) {
+      appendLocalTrace("local-context-guard", "scratch_blocked", {
+        file: scratchName,
+        existing: Array.from(workspaceScratchFiles),
+      });
+      return {
+        block: true,
+        reason: `Local tool guard: blocked throwaway scratch script '${scratchName}' (${workspaceScratchFiles.size} already created: ${Array.from(workspaceScratchFiles).join(", ")}). Reuse one existing script or write the next real workspace deliverable directly.`,
+      };
+    }
+
     if (isPythonInlineProbe(toolName, input)) {
       const cmdLen = typeof input?.command === "string" ? input.command.length : 0;
       if (cmdLen >= HARD_PYTHON_INLINE_CHARS) {
         return {
           block: true,
           reason:
-            "Local tool guard: blocked large inline python3 -c script (>= 800 chars). Put reusable analysis logic into a real workspace .py file (for example inspect_schema.py or analyze_dupes.py) using write(path, content) instead of giant inline python3 -c commands.",
+            `Local tool guard: blocked large inline python3 -c script (>= 800 chars). Put reusable logic into a .py file with write(path, content), or patch existing files with edit(${HASHLINE_EDIT_EXAMPLE}).`,
         };
       }
       if (consecutivePythonProbes >= HARD_PYTHON_PROBE_STREAK) {
@@ -1147,13 +1307,13 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
         return {
           block: true,
           reason:
-            "Loop guard + heredoc guard: you already tried this blocked heredoc. Stop calling bash for this write. Call edit(path, oldText, newText) to update an existing file or write(path, content) for a new file.",
+            `Loop guard + heredoc guard: you already tried this blocked heredoc. Stop calling bash for this write. Call edit(${HASHLINE_EDIT_EXAMPLE}) to update an existing file or write(path, content) for a new file.`,
         };
       }
       return {
         block: true,
         reason:
-          "Local tool guard: blocked large multi-line bash heredoc (>= 1000 chars). Use write(path, content) for new files or edit(path, oldText, newText) to update existing files.",
+          `Local tool guard: blocked large multi-line bash heredoc (>= 1000 chars). Use write(path, content) for new files or edit(${HASHLINE_EDIT_EXAMPLE}) to update existing files.`,
       };
     }
 
@@ -1192,6 +1352,31 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     }
 
     const hints: string[] = [];
+    if (!event.isError) {
+      const scratchWritten = isWorkspaceScratchScript(toolName, event.input);
+      if (scratchWritten) {
+        workspaceScratchFiles.add(scratchWritten);
+        if (workspaceScratchFiles.size === 2) {
+          hints.push(
+            `[Workspace hygiene hint: Already created 2 throwaway scripts (${Array.from(workspaceScratchFiles).join(", ")}). Update one existing script or write the real deliverable instead of spawning more _explore/_probe files.]`,
+          );
+        }
+      }
+    }
+
+    if (toolName === "read" && !event.isError) {
+      const readPath = String(event.input?.path ?? event.input?.file_path ?? "").trim();
+      if (readPath) {
+        const prevReads = (fileReadCounts.get(readPath) ?? 0) + 1;
+        fileReadCounts.set(readPath, prevReads);
+        if (prevReads >= 4 && (prevReads - 4) % 3 === 0) {
+          hints.push(
+            `[Read efficiency hint: Read ${path.basename(readPath)} ${prevReads} times. Use pi-outline or read one larger offset/limit slice and save key line anchors in notes.md.]`,
+          );
+        }
+      }
+    }
+
     if (isLargeHeredocCommand(toolName, event.input)) {
       hints.push(
         "[Local tool hint: Avoid multi-line bash heredocs. Put scripts in .py files using write or edit so you do not burn output tokens rewriting inline code.]",
@@ -1214,7 +1399,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       consecutiveShellReadProbes % INLINE_PROBE_STREAK_WARN === 0
     ) {
       hints.push(
-        `[Local efficiency hint: ${consecutiveShellReadProbes} consecutive bash cat/head/tail/sed reads. Prefer read(path, offset, limit) or edit(path, oldText, newText) instead of chaining shell reads.]`,
+        `[Local efficiency hint: ${consecutiveShellReadProbes} consecutive bash cat/head/tail/sed reads. Prefer read(path, offset, limit) or edit(${HASHLINE_EDIT_EXAMPLE}) instead of chaining shell reads.]`,
       );
     }
 
@@ -1366,6 +1551,34 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
         }
       }
 
+      if (/\bpi-verify-ui\b/.test(cmd)) {
+        piVerifyUiRan = true;
+      } else if (!piVerifyUiRan && /\bagent-browser\s+open\b/.test(cmd)) {
+        hints.push(
+          "[Browser efficiency hint: Run pi-verify-ui /ABS/PATH/file.html (with optional --eval-js) first for a single-shot headless Chromium DOM, layout, and error audit before running agent-browser calls.]",
+        );
+      }
+
+      if (
+        cmd.length > 0 &&
+        cmd.length < 160 &&
+        !/\bpi-verify-ui\b/.test(cmd) &&
+        !/\b(?:python3?|node)\s+[a-zA-Z0-9_.-]+\.(?:py|js|mjs)\b/.test(cmd)
+      ) {
+        consecutiveShortBash += 1;
+        if (
+          SHORT_BASH_STREAK_NUDGE > 0 &&
+          consecutiveShortBash >= SHORT_BASH_STREAK_NUDGE &&
+          consecutiveShortBash % SHORT_BASH_STREAK_NUDGE === 0
+        ) {
+          hints.push(
+            `[Bash efficiency hint: ${consecutiveShortBash} consecutive short shell commands. Chain independent read-only checks into 1 command with && or ; and append || true to grep checks expecting 0 matches.]`,
+          );
+        }
+      } else {
+        consecutiveShortBash = 0;
+      }
+
       const sessions = extractAgentBrowserSessions(cmd);
       for (const s of sessions.closed) {
         openBrowserSessions.delete(s);
@@ -1403,13 +1616,28 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       }
     }
 
-    if (toolName === "edit" && event.isError && /Could not find (?:the exact text|edits\[\d+\])/i.test(fullText)) {
-      const targetPath = String(event.input?.path ?? event.input?.file_path ?? "");
-      const editsArr = Array.isArray(event.input?.edits) ? (event.input.edits as Record<string, unknown>[]) : null;
-      const firstOldText = String(editsArr?.[0]?.oldText ?? event.input?.oldText ?? "");
-      const lineHint = findClosestEditLineHint(targetPath, firstOldText, ctx.cwd);
-      if (lineHint) {
-        hints.push(lineHint);
+    if (toolName === "edit" && event.isError) {
+      if (/\[E_DUPLICATE_EDIT\]/i.test(fullText)) {
+        hints.push(
+          "[Duplicate edit hint: This exact edit is already applied on disk. Do not resend it; move directly to your next edit or verification step.]",
+        );
+      } else if (/Could not find (?:the exact text|edits\[\d+\])|\[E_NO_MATCH\]|\[E_BAD_REF\]|\[E_STALE_ANCHOR\]|requires an "edits" array/i.test(fullText)) {
+        const targetPath = String(event.input?.path ?? event.input?.file_path ?? "");
+        const editsArr = Array.isArray(event.input?.edits) ? (event.input.edits as Record<string, unknown>[]) : null;
+        const firstOldText = String(editsArr?.[0]?.oldText ?? editsArr?.[0]?.old_text ?? event.input?.oldText ?? "");
+        const lineHint = findClosestEditLineHint(targetPath, firstOldText, ctx.cwd);
+        if (lineHint) {
+          hints.push(lineHint);
+        }
+        if (/requires an "edits" array/i.test(fullText)) {
+          hints.push(
+            `[Edit schema hint: Pass "edits" as a real JSON array of objects, never a single-quoted string. Example: ${HASHLINE_EDIT_EXAMPLE}]`,
+          );
+        } else if (/\[E_BAD_REF\]|\[E_STALE_ANCHOR\]/i.test(fullText)) {
+          hints.push(
+            "[Anchor hint: Re-read the target line range with read(path, offset, limit) to copy exact LINE#HASH tags, or pass op='replace_text' with oldText/newText inside edits.]",
+          );
+        }
       }
     }
 

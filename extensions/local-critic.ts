@@ -202,6 +202,13 @@ async function runFreshCritic(ctx: ExtensionContext, focus: string): Promise<{ p
   }
 }
 
+export function shouldSkipAutoCriticForProvider(provider: string): boolean {
+  return (
+    String(provider || "").trim().toLowerCase() === "inkling-local" &&
+    process.env.PI_LOCAL_AUTO_CRITIC_FORCE !== "1"
+  );
+}
+
 export default function localCriticExtension(pi: ExtensionAPI) {
   let criticRanThisTask = false;
   let lastUserPrompt = "";
@@ -263,6 +270,13 @@ export default function localCriticExtension(pi: ExtensionAPI) {
     if (process.env.PI_LOCAL_AUTO_CRITIC !== "1") return;
     if (criticRanThisTask || !sessionActive) return;
     if (fs.existsSync(path.join(ctx.cwd, ".pi-handoff.md"))) return;
+
+    const provider = String((ctx.model as { provider?: string } | undefined)?.provider || "");
+    if (shouldSkipAutoCriticForProvider(provider)) {
+      criticRanThisTask = true;
+      appendLocalTrace("local-critic", "auto_critic_skipped_gdn", { provider });
+      return;
+    }
 
     criticRanThisTask = true;
     const verdict = await runFreshCritic(ctx, lastUserPrompt);

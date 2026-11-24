@@ -16,7 +16,7 @@ KV_FORMAT="${ORNITH_KV_FORMAT:-int8}"
 PREFILL_MODE="${ORNITH_PREFILL_MODE:-full}"
 MAX_MEMORY="${ORNITH_MAX_MEMORY:-34G}"
 THINK_BUDGET="${ORNITH_THINKING_BUDGET:-2048}"
-THINK_END_TEXT=$'\nI have the design ready. Let me write and verify the code now.\n</think>'
+THINK_END_TEXT=$'\nPlan is complete. Emit the next tool call directly now.\n</think>'
 
 is_serving() {
   curl -sf --max-time 2 "$URL/v1/models" 2>/dev/null | /opt/homebrew/bin/python3.12 -c '

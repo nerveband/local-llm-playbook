@@ -12,12 +12,13 @@ import {
   extractAgentBrowserSessions,
   findClosestEditLineHint,
   inspectJsonClusterSkew,
+  isWorkspaceScratchScript,
   lintFileIssues,
   repairEditArguments,
   repairMacOsTimeoutCommand,
 } from "../extensions/local-context-guard.ts";
 import { evaluateVerifySpec } from "../extensions/local-goal-gate.ts";
-import { parseCriticVerdict, collectCriticBundle } from "../extensions/local-critic.ts";
+import { parseCriticVerdict, collectCriticBundle, shouldSkipAutoCriticForProvider } from "../extensions/local-critic.ts";
 import {
   isSplashProvider,
   resolveEscalatedThinkingLevel,
@@ -215,7 +216,12 @@ test("local-critic parser, PII-free bundle collection, meter helpers, and trace 
   assert.equal(isSplashProvider("surogate-local"), true);
   assert.equal(isSplashProvider("inkling-local"), false);
   assert.equal(resolveServerOrigin({ provider: "ornith-splash" }), "http://127.0.0.1:18092");
+  assert.equal(resolveSplashThinkingBudget("low"), 640);
+  assert.equal(resolveSplashThinkingBudget("medium"), 1152);
   assert.equal(resolveSplashThinkingBudget("high"), 2048);
+  assert.equal(shouldSkipAutoCriticForProvider("inkling-local"), true);
+  assert.equal(shouldSkipAutoCriticForProvider("ornith-splash"), false);
+  assert.equal(shouldSkipAutoCriticForProvider("surogate-local"), false);
   assert.equal(resolveInklingReasoningEffort("low"), "0.25");
   assert.equal(resolveInklingReasoningEffort("medium"), "0.50");
   assert.equal(resolveInklingReasoningEffort("high"), "0.75");
@@ -321,4 +327,76 @@ test("checkPythonPerfHazards catches unguarded O(K^2) loops and allows guarded o
     "            pair_score(items[i], items[j])",
   ].join("\n");
   assert.deepEqual(checkPythonPerfHazards(guarded), []);
+});
+
+test("repairEditArguments handles missing closing bracket, single-quoted Python lines, double-escaped quotes, and replace_text", () => {
+  withTempDir((dir) => {
+    const file = path.join(dir, "sample.py");
+    fs.writeFileSync(file, "def f():\n    x = 1\n    return x\n", "utf-8");
+
+    // 1. Missing trailing ] + \' inside double-quoted JSON string (real Surogate failure)
+    const missingBracket = {
+      path: "sample.py",
+      edits: '[{"op": "replace", "pos": "2#ab", "lines": ["        acct = txn.get(r[\'TransactionNumber\'])"]}',
+    };
+    assert.equal(repairEditArguments(missingBracket, dir), true);
+    assert.ok(Array.isArray(missingBracket.edits));
+    assert.equal(missingBracket.edits[0].lines[0], "        acct = txn.get(r['TransactionNumber'])");
+
+    // 2. Python single-quoted lines array (real Ornith failure)
+    const singleQuoted = {
+      path: "sample.py",
+      edits: '[{"op": "replace", "pos": "2#ab", "lines": [\'contact_cluster("Addresses.csv", "Street", "address")\']}]',
+    };
+    assert.equal(repairEditArguments(singleQuoted, dir), true);
+    assert.ok(Array.isArray(singleQuoted.edits));
+    assert.equal(singleQuoted.edits[0].lines[0], 'contact_cluster("Addresses.csv", "Street", "address")');
+
+    // 3. Double-escaped inner quotes inside JSON string (real Ornith failure)
+    const doubleEscaped = {
+      path: "sample.py",
+      edits: '[{"op": "replace", "pos": "2#ab", "lines": ["      if (tab === \\\\"actionable\\\\") return true;"]}]',
+    };
+    assert.equal(repairEditArguments(doubleEscaped, dir), true);
+    assert.ok(Array.isArray(doubleEscaped.edits));
+    assert.equal(doubleEscaped.edits[0].lines[0], '      if (tab === "actionable") return true;');
+
+    // 4. Hashline replace_text item indent shift recovery
+    const replaceText = {
+      path: "sample.py",
+      edits: [{ op: "replace_text", old_text: "x = 1\nreturn x", new_text: "x = 2\nreturn x" }],
+    };
+    assert.equal(repairEditArguments(replaceText, dir), true);
+    assert.equal(replaceText.edits[0].oldText, "    x = 1\n    return x");
+    assert.equal(replaceText.edits[0].newText, "    x = 2\n    return x");
+  });
+});
+
+test("isWorkspaceScratchScript and pi-verify-ui zeroSizeSelectors + file input exclusion work cleanly", () => {
+  assert.equal(isWorkspaceScratchScript("write", { path: "_explore4.py" }), "_explore4.py");
+  assert.equal(isWorkspaceScratchScript("write", { path: "/tmp/_probe_csv.py" }), "_probe_csv.py");
+  assert.equal(isWorkspaceScratchScript("write", { path: "analyze_dupes.py" }), null);
+  assert.equal(isWorkspaceScratchScript("write", { path: "review_ui.js" }), null);
+
+  withTempDir((dir) => {
+    const html = path.join(dir, "ui.html");
+    fs.writeFileSync(
+      html,
+      [
+        "<!doctype html><html><head><title>Test UI</title></head><body>",
+        "<h1>Duplicate Review Queue</h1>",
+        "<p>Loaded groups ready for approval and keyboard shortcuts check.</p>",
+        '<input type="file" id="importFile" style="width:0;height:0">',
+        '<button id="btnOk">Approve</button>',
+        '<button id="zeroBtn" class="tiny-btn" style="width:0;height:0;padding:0;border:0"></button>',
+        "</body></html>",
+      ].join("\n"),
+      "utf-8",
+    );
+    const raw = execFileSync(path.join(REPO_DIR, "bin/pi-verify-ui"), [html], { encoding: "utf-8" });
+    const parsed = JSON.parse(raw.trim().split("\n").pop());
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.zeroSizeInteractive, 1);
+    assert.deepEqual(parsed.zeroSizeSelectors, ["button#zeroBtn.tiny-btn"]);
+  });
 });

@@ -13,7 +13,7 @@ VERIFY_ROWS="${SUROGATE_VERIFY_ROWS:-auto}"
 KV_FORMAT="${SUROGATE_KV_FORMAT:-int8}"
 PREFILL_MODE="${SUROGATE_PREFILL_MODE:-full}"
 THINK_BUDGET="${SUROGATE_THINKING_BUDGET:-2048}"
-THINK_END_TEXT=$'\nI have the design ready. Let me write and verify the code now.\n</think>'
+THINK_END_TEXT=$'\nPlan is complete. Emit the next tool call directly now.\n</think>'
 
 is_serving() {
   curl -sf --max-time 2 "$URL/v1/models" 2>/dev/null | /opt/homebrew/bin/python3.12 -c '

@@ -124,16 +124,16 @@ export function resolveInklingReasoningEffort(level: string | undefined): string
 export function resolveSplashThinkingBudget(level: string | undefined): number | undefined {
   switch (String(level || "").trim().toLowerCase()) {
     case "minimal":
-      return 512;
+      return 384;
     case "low":
-      return 1024;
+      return 640;
     case "medium":
-      return 1536;
+      return 1152;
     case "high":
       return 2048;
     case "xhigh":
     case "max":
-      return 4096;
+      return 3072;
     default:
       return undefined;
   }

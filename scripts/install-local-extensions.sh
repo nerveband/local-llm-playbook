@@ -17,10 +17,12 @@ for bin_name in pi-local pi-outline pi-preflight pi-verify-ui; do
   fi
 done
 
-if [[ -f "$SCRIPT_DIR/ornith-splash" ]]; then
-  chmod +x "$SCRIPT_DIR/ornith-splash"
-  cp "$SCRIPT_DIR/ornith-splash" "$HOME/.local/bin/ornith-splash"
-  chmod +x "$HOME/.local/bin/ornith-splash"
-fi
+for helper_script in ornith-splash surogate-splash inkling-omlx; do
+  if [[ -f "$SCRIPT_DIR/$helper_script" ]]; then
+    chmod +x "$SCRIPT_DIR/$helper_script"
+    cp "$SCRIPT_DIR/$helper_script" "$HOME/.local/bin/$helper_script"
+    chmod +x "$HOME/.local/bin/$helper_script"
+  fi
+done
 
 print "Installed local extensions in $EXT_DIR and linked helpers in $HOME/.local/bin"
