@@ -260,12 +260,17 @@ start_inkling() {
 stop_ornith() {
   osascript -e 'tell application "oMLX" to quit' >/dev/null 2>&1 || true
   local stopped=0
+  local pkill_sent=0
   local code=""
-  for _ in {1..40}; do
+  for i in {1..40}; do
     code=$(port_http_code "http://127.0.0.1:8000/v1/models")
     if [[ "$code" == "000" ]] && ! ornith_app_running; then
       stopped=1
       break
+    fi
+    if [[ "$pkill_sent" == "0" && "$i" -ge 6 ]]; then
+      pkill -TERM -x oMLX >/dev/null 2>&1 || true
+      pkill_sent=1
     fi
     sleep 0.5
   done

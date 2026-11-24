@@ -425,7 +425,7 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
     const nextPayload: Record<string, unknown> = { ...payload };
     let changed = false;
 
-    if (provider === "surogate-local") {
+    if (provider === "surogate-local" || provider === "omlx-local" || provider === "omlx") {
       if (nextPayload.temperature === undefined) {
         nextPayload.temperature = 0.65;
         changed = true;
@@ -438,6 +438,9 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
         nextPayload.top_k = 20;
         changed = true;
       }
+    }
+
+    if (provider === "surogate-local") {
       const rawKwargs =
         nextPayload.chat_template_kwargs && typeof nextPayload.chat_template_kwargs === "object"
           ? (nextPayload.chat_template_kwargs as Record<string, unknown>)

@@ -184,8 +184,58 @@ function isShellReadProbe(toolName: string, input: Record<string, unknown> | und
 }
 
 const MAX_REPAIR_FILE_BYTES = 2_097_152;
+const SLOW_BASH_MS = Number(process.env.PI_LOCAL_SLOW_BASH_MS || 60000);
+const MAX_PREMATURE_RETRIES = 2;
+const AGENT_BROWSER_EVAL_BATCH_NUDGE = Number(process.env.PI_LOCAL_AB_EVAL_NUDGE || 6);
 const VERIFY_SCRIPT_CMD_RE =
   /(?:^|[\s/])(?:_?verify|verify_|_?harness|test_)[a-zA-Z0-9_.-]*\.(?:js|mjs|cjs|py)\b/i;
+
+export interface AssistantTurnSnapshot {
+  stopReason?: string;
+  toolCallCount: number;
+  visibleText: string;
+  thinkingChars: number;
+  hadToolCallsInSession: boolean;
+}
+
+/** Detect when a local model stops mid-task (blank output after thinking, or announced intent without a tool call). */
+export function detectPrematureStop(
+  snapshot: AssistantTurnSnapshot,
+): "empty_after_thinking" | "announced_intent" | null {
+  if (!snapshot.hadToolCallsInSession || snapshot.toolCallCount > 0) return null;
+  const stop = String(snapshot.stopReason || "").toLowerCase();
+  if (stop !== "stop" && stop !== "length") return null;
+  const trimmed = snapshot.visibleText.trim();
+  if (trimmed.length === 0) {
+    return "empty_after_thinking";
+  }
+  if (
+    trimmed.length <= 400 &&
+    (trimmed.endsWith(":") ||
+      /\b(?:let me|now i(?:'ll| will)|i(?:'ll| will) now|next,?\s+i(?:'ll| will)|i am going to)\b[^.?!]{0,140}(?::|\.\.\.)?\s*$/i.test(
+        trimmed,
+      ))
+  ) {
+    return "announced_intent";
+  }
+  return null;
+}
+
+/** Extract named agent-browser sessions opened or closed by a bash command. */
+export function extractAgentBrowserSessions(cmd: string): { opened: string[]; closed: string[] } {
+  const opened: string[] = [];
+  const closed: string[] = [];
+  if (!cmd || !/\bagent-browser\b/.test(cmd)) return { opened, closed };
+  const sessionMatch = cmd.match(/\bAGENT_BROWSER_SESSION=(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.:-]+))/);
+  const sess = sessionMatch ? (sessionMatch[1] ?? sessionMatch[2] ?? sessionMatch[3] ?? "").trim() : "";
+  if (!sess) return { opened, closed };
+  if (/\bagent-browser\b[^\n;&|]*\bclose\b/.test(cmd)) {
+    closed.push(sess);
+  } else if (/\bagent-browser\b[^\n;&|]*\bopen\b/.test(cmd)) {
+    opened.push(sess);
+  }
+  return { opened, closed };
+}
 
 function resolveWorkspacePath(filePath: string, cwd: string): string | null {
   const trimmed = filePath.trim();
@@ -203,16 +253,31 @@ function tryParseJsonObjectOrArray(raw: string): unknown {
   if (fence) {
     cleaned = fence[1].trim();
   }
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    const noTrailing = cleaned.replace(/,\s*([}\]])/g, "$1");
+  const attempts = [cleaned, cleaned.replace(/,\s*([}\]])/g, "$1")];
+  if (cleaned.includes('"""')) {
+    const fixedTriple = cleaned
+      .replace(/:\s*"""([\s\S]*?)"""(?=\s*[,}\]])/g, (_m, inner: string) => `: ${JSON.stringify(inner)}`)
+      .replace(/,\s*([}\]])/g, "$1");
+    attempts.push(fixedTriple);
+  }
+  for (const candidate of attempts) {
     try {
-      return JSON.parse(noTrailing);
+      return JSON.parse(candidate);
     } catch {
-      return null;
+      // Try next fallback
     }
   }
+  return null;
+}
+
+function parseXmlEditString(raw: string): { oldText: string; newText: string } | null {
+  const oldMatch = raw.match(/<oldText>([\s\S]*?)<\/oldText>|<old_text>([\s\S]*?)<\/old_text>/i);
+  const newMatch = raw.match(/<newText>([\s\S]*?)<\/newText>|<new_text>([\s\S]*?)<\/new_text>/i);
+  if (!oldMatch || !newMatch) return null;
+  return {
+    oldText: oldMatch[1] ?? oldMatch[2] ?? "",
+    newText: newMatch[1] ?? newMatch[2] ?? "",
+  };
 }
 
 function normalizeEditItem(item: unknown): { value: Record<string, unknown> | null; changed: boolean } {
@@ -302,9 +367,29 @@ function shiftBlockIndent(text: string, oldNonEmpty: string[], diskNonEmpty: str
     .join("");
 }
 
-/** Repair stringified edit arguments and recover unique whitespace/line-ending mismatches safely. */
+/** Repair stringified or XML edit arguments and recover unique whitespace/line-ending mismatches safely. */
 export function repairEditArguments(args: Record<string, unknown>, cwd: string): boolean {
   let changed = false;
+
+  if (args.edits === undefined && typeof args.edit === "string") {
+    const xmlPair = parseXmlEditString(args.edit);
+    if (xmlPair) {
+      args.edits = [xmlPair];
+      delete args.edit;
+      changed = true;
+    } else {
+      const parsed = tryParseJsonObjectOrArray(args.edit);
+      if (Array.isArray(parsed)) {
+        args.edits = parsed;
+        delete args.edit;
+        changed = true;
+      } else if (parsed && typeof parsed === "object") {
+        args.edits = [parsed];
+        delete args.edit;
+        changed = true;
+      }
+    }
+  }
 
   if (typeof args.edits === "string") {
     const parsed = tryParseJsonObjectOrArray(args.edits);
@@ -585,8 +670,14 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
   let consecutivePythonProbes = 0;
   let consecutiveShellReadProbes = 0;
   let consecutiveVerifyScriptErrors = 0;
+  let consecutiveAgentBrowserEvals = 0;
+  let hadToolCallsInSession = false;
+  let consecutivePrematureRetries = 0;
+  let lastAssistantSnapshot: Omit<AssistantTurnSnapshot, "hadToolCallsInSession"> | null = null;
+  const bashStartTimes = new Map<string, number>();
+  const openBrowserSessions = new Set<string>();
 
-  pi.on("session_start", () => {
+  function resetAllCounters(): void {
     consecutiveErrors = 0;
     lastErrorSignature = "";
     lastCallSignature = "";
@@ -594,36 +685,54 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     consecutivePythonProbes = 0;
     consecutiveShellReadProbes = 0;
     consecutiveVerifyScriptErrors = 0;
+    consecutiveAgentBrowserEvals = 0;
+    consecutivePrematureRetries = 0;
+    lastAssistantSnapshot = null;
+    bashStartTimes.clear();
+  }
+
+  pi.on("session_start", () => {
+    resetAllCounters();
+    hadToolCallsInSession = false;
+    openBrowserSessions.clear();
   });
 
   pi.on("input", () => {
-    consecutiveErrors = 0;
-    lastErrorSignature = "";
-    lastCallSignature = "";
-    consecutiveSameCall = 0;
-    consecutivePythonProbes = 0;
-    consecutiveShellReadProbes = 0;
-    consecutiveVerifyScriptErrors = 0;
+    resetAllCounters();
   });
 
-  // Run auto-repairs before Pi schema validation and tool_call execution.
+  // Run auto-repairs before Pi schema validation and track assistant completion state.
   pi.on("message_end", (event, ctx) => {
-    const msg = event.message as { role?: string; content?: unknown[] } | undefined;
+    const msg = event.message as { role?: string; stopReason?: string; content?: unknown[] } | undefined;
     if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) return;
 
     let repaired = false;
+    let toolCallCount = 0;
+    let thinkingChars = 0;
+    const textParts: string[] = [];
+
     for (const part of msg.content) {
       if (!part || typeof part !== "object" || Array.isArray(part)) continue;
-      const call = part as { type?: string; name?: string; arguments?: unknown };
-      if (call.type !== "toolCall" || !call.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments)) {
+      const item = part as { type?: string; text?: string; thinking?: string; name?: string; arguments?: unknown };
+      if (item.type === "thinking" && typeof item.thinking === "string") {
+        thinkingChars += item.thinking.length;
         continue;
       }
-      const args = call.arguments as Record<string, unknown>;
-      if (call.name === "edit") {
+      if (item.type === "text" && typeof item.text === "string") {
+        textParts.push(item.text);
+        continue;
+      }
+      if (item.type !== "toolCall") continue;
+      toolCallCount += 1;
+      if (!item.arguments || typeof item.arguments !== "object" || Array.isArray(item.arguments)) {
+        continue;
+      }
+      const args = item.arguments as Record<string, unknown>;
+      if (item.name === "edit") {
         if (repairEditArguments(args, ctx.cwd)) {
           repaired = true;
         }
-      } else if (call.name === "bash" && typeof args.command === "string") {
+      } else if (item.name === "bash" && typeof args.command === "string") {
         const nextCmd = repairMacOsTimeoutCommand(args.command);
         if (nextCmd !== args.command) {
           args.command = nextCmd;
@@ -632,13 +741,25 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       }
     }
 
+    lastAssistantSnapshot = {
+      stopReason: msg.stopReason,
+      toolCallCount,
+      visibleText: textParts.join("\n"),
+      thinkingChars,
+    };
+
     return repaired ? { message: event.message as any } : undefined;
   });
 
   pi.on("tool_call", (event) => {
     const toolName = String(event.toolName || "");
+    hadToolCallsInSession = true;
+    consecutivePrematureRetries = 0;
     if (toolName === "phase_handoff") {
       return;
+    }
+    if (toolName === "bash") {
+      bashStartTimes.set(String((event as { toolCallId?: string }).toolCallId || "last"), Date.now());
     }
     const input = event.input as Record<string, unknown> | undefined;
     const sig = summarizeCallSignature(toolName, input);
@@ -704,18 +825,24 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     if (toolName === "phase_handoff") {
       consecutivePythonProbes = 0;
       consecutiveShellReadProbes = 0;
+      consecutiveAgentBrowserEvals = 0;
       return;
     }
 
     if (isPythonInlineProbe(toolName, event.input)) {
       consecutivePythonProbes += 1;
       consecutiveShellReadProbes = 0;
+      consecutiveAgentBrowserEvals = 0;
     } else if (isShellReadProbe(toolName, event.input)) {
       consecutiveShellReadProbes += 1;
       consecutivePythonProbes = 0;
+      consecutiveAgentBrowserEvals = 0;
     } else if (toolName === "write" || toolName === "edit" || toolName === "read" || toolName === "bash") {
       consecutivePythonProbes = 0;
       consecutiveShellReadProbes = 0;
+      if (toolName !== "bash") {
+        consecutiveAgentBrowserEvals = 0;
+      }
     }
 
     const hints: string[] = [];
@@ -797,6 +924,43 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
 
     if (toolName === "bash") {
       const cmd = typeof event.input?.command === "string" ? event.input.command : "";
+      const callKey = String((event as { toolCallId?: string }).toolCallId || "last");
+      const startedAt = bashStartTimes.get(callKey);
+      bashStartTimes.delete(callKey);
+      if (startedAt !== undefined && SLOW_BASH_MS > 0) {
+        const elapsedMs = Date.now() - startedAt;
+        if (elapsedMs >= SLOW_BASH_MS) {
+          hints.push(
+            `[Runtime efficiency hint: That bash command took ${Math.round(elapsedMs / 1000)}s. Check for O(K^2) loops, unindexed joins, or mega-clusters on low-cardinality fields before re-running.]`,
+          );
+        }
+      }
+
+      const sessions = extractAgentBrowserSessions(cmd);
+      for (const s of sessions.closed) {
+        openBrowserSessions.delete(s);
+      }
+      if (!event.isError) {
+        for (const s of sessions.opened) {
+          openBrowserSessions.add(s);
+        }
+      }
+
+      if (/\bagent-browser\s+eval\b/.test(cmd)) {
+        consecutiveAgentBrowserEvals += 1;
+        if (
+          AGENT_BROWSER_EVAL_BATCH_NUDGE > 0 &&
+          consecutiveAgentBrowserEvals >= AGENT_BROWSER_EVAL_BATCH_NUDGE &&
+          consecutiveAgentBrowserEvals % AGENT_BROWSER_EVAL_BATCH_NUDGE === 0
+        ) {
+          hints.push(
+            `[Browser efficiency hint: ${consecutiveAgentBrowserEvals} consecutive agent-browser eval calls. Batch all remaining DOM and interaction assertions into 1 compound IIFE returning compact JSON, then run agent-browser close.]`,
+          );
+        }
+      } else {
+        consecutiveAgentBrowserEvals = 0;
+      }
+
       if (!event.isError || /\bagent-browser\b/.test(cmd)) {
         consecutiveVerifyScriptErrors = 0;
       } else if (VERIFY_SCRIPT_CMD_RE.test(cmd)) {
@@ -809,7 +973,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       }
     }
 
-    if (toolName === "edit" && event.isError && /Could not find the exact text/i.test(fullText)) {
+    if (toolName === "edit" && event.isError && /Could not find (?:the exact text|edits\[\d+\])/i.test(fullText)) {
       const targetPath = String(event.input?.path ?? event.input?.file_path ?? "");
       const editsArr = Array.isArray(event.input?.edits) ? (event.input.edits as Record<string, unknown>[]) : null;
       const firstOldText = String(editsArr?.[0]?.oldText ?? event.input?.oldText ?? "");
@@ -895,5 +1059,40 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
         ? { structuredContent: event.structuredContent }
         : {}),
     };
+  });
+
+  pi.on("agent_end", (_event, ctx) => {
+    if (!lastAssistantSnapshot) return;
+    if (fs.existsSync(path.join(ctx.cwd, ".pi-handoff.md"))) return;
+    const reason = detectPrematureStop({
+      ...lastAssistantSnapshot,
+      hadToolCallsInSession,
+    });
+    if (!reason || consecutivePrematureRetries >= MAX_PREMATURE_RETRIES) return;
+
+    consecutivePrematureRetries += 1;
+    ctx.ui?.notify?.(
+      `Auto-continuing after premature stop (${reason}, retry ${consecutivePrematureRetries}/${MAX_PREMATURE_RETRIES})...`,
+      "info",
+    );
+    pi.sendUserMessage(
+      "You stopped mid-task without calling a tool or finishing your response. Continue immediately: execute your next tool call, verify all deliverables, and write your final summary only when everything is complete.",
+      { deliverAs: "followUp" },
+    );
+  });
+
+  pi.on("session_shutdown", () => {
+    for (const sess of openBrowserSessions) {
+      try {
+        execFileSync("agent-browser", ["close"], {
+          env: { ...process.env, AGENT_BROWSER_SESSION: sess },
+          timeout: 3000,
+          stdio: "ignore",
+        });
+      } catch {
+        // Ignore cleanup errors during shutdown.
+      }
+    }
+    openBrowserSessions.clear();
   });
 }
