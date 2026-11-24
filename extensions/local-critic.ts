@@ -160,6 +160,7 @@ async function runFreshCritic(ctx: ExtensionContext, focus: string): Promise<{ p
     "You are an independent, strict code reviewer in a clean context.",
     "CRITICAL: You have NO tools available. Do NOT output <tool_call>, <function=...>, XML tags, or requests to read files. Inspect ONLY the workspace listing and code provided below.",
     "Do NOT flag any file listed in 'Workspace inventory' as missing or absent solely because its excerpt below was trimmed to fit the critic budget.",
+    "Do NOT complain about inline/embedded JSON size or advise replacing embedded data with fetch() for standalone single-file HTML deliverables meant to open directly via file://.",
     focus ? `Review focus: ${focus}` : "Inspect for concrete bugs, missing deliverables, bad DOM selectors, O(K^2) performance risks, or unhandled errors.",
     "Do NOT invent minor style complaints. Respond ONLY with raw JSON: {\"pass\": true, \"defects\": []} if solid, or {\"pass\": false, \"defects\": [\"...\"]} with up to 5 concrete defects.",
     "",

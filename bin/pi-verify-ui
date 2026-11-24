@@ -56,11 +56,18 @@ if ! command -v agent-browser >/dev/null 2>&1; then
 fi
 
 export AGENT_BROWSER_SESSION="$SESSION"
+AB_BEFORE=" $( (pgrep -f 'agent-browser-darwin-arm64' 2>/dev/null || true) | tr '\n' ' ') "
 cleanup() {
   agent-browser close >/dev/null 2>&1 || true
   pkill -TERM -f -- "AGENT_BROWSER_SESSION=$SESSION" >/dev/null 2>&1 || true
   if [[ "${PI_VERIFY_UI_SWEEP:-0}" == "1" ]]; then
     pkill -TERM -f -- "agent-browser-darwin-arm64" >/dev/null 2>&1 || true
+  else
+    for ab_pid in ${(f)"$(pgrep -f 'agent-browser-darwin-arm64' 2>/dev/null || true)"}; do
+      if [[ -n "$ab_pid" && "$AB_BEFORE" != *" $ab_pid "* ]]; then
+        kill -TERM "$ab_pid" >/dev/null 2>&1 || true
+      fi
+    done
   fi
 }
 trap cleanup EXIT INT TERM
