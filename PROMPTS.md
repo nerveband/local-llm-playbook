@@ -11,13 +11,13 @@ Rules for working cleanly in local context:
 2. Start with a small `inspect_schema.py` script that prints column names, row counts, null rates, and 3 to 5 sample values per file. Stream any large CSV line by line instead of loading huge raw tables into chat.
 3. Put all reusable logic into concise `.py` script files (`250` to `350` lines when possible) using `write`/`edit` tools instead of giant inline shell heredocs. Edit functions in place.
 4. Keep printed stdout summaries under 20 lines. Write detailed, compact outputs to disk (keep embedded JSON reports under `6 MB`, storing summary fields per record rather than full raw blobs).
-5. Finish Phase 1 with verified summary numbers and `notes.md` saved on disk, then call `phase_handoff` (`auto_continue: false`) so I can review before Phase 2.
+5. Finish Phase 1 with verified summary numbers, exact CSV column names, and `notes.md` saved on disk, then call `phase_handoff` (`auto_continue: false`, `next_thinking_level: "low"` for UI/script builds or `"medium"` for analysis) so I can review before Phase 2.
 ```
 
 Add these two lines instead if you want hands-free automatic transition to Phase 2 without stopping for review (remember to state explicitly that the final phase must not call `phase_handoff` again):
 
 ```text
-When Phase 1 is complete and verified on disk, update `notes.md` and call `phase_handoff` with `auto_continue: true` and a self-contained Phase 2 task prompt, then stop calling tools so Pi starts Phase 2 in a fresh session automatically. After Phase 2 finishes and passes verification, stop directly without calling `phase_handoff` again.
+When Phase 1 is complete and verified on disk, update `notes.md` and call `phase_handoff` with `auto_continue: true`, exact CSV/JSON column names in `summary`, `next_thinking_level: "low"`, and a self-contained Phase 2 task prompt, then stop calling tools so Pi starts Phase 2 in a fresh session automatically. After Phase 2 finishes and passes verification, stop directly without calling `phase_handoff` again.
 ```
 
 ---

@@ -124,11 +124,33 @@ function summarizeCallSignature(toolName: string, input: Record<string, unknown>
   }
 }
 
-function isLargeHeredocCommand(toolName: string, input: Record<string, unknown> | undefined): boolean {
-  if (toolName !== "bash" || !input) return false;
+const HARD_HEREDOC_CHARS = Number(process.env.PI_LOCAL_HARD_HEREDOC_CHARS || 1000);
+const INLINE_PROBE_STREAK_WARN = Number(process.env.PI_LOCAL_INLINE_PROBE_WARN || 3);
+
+function isHeredocCommand(toolName: string, input: Record<string, unknown> | undefined): { isHeredoc: boolean; length: number } {
+  if (toolName !== "bash" || !input) return { isHeredoc: false, length: 0 };
   const cmd = typeof input.command === "string" ? input.command : "";
-  if (cmd.length < 400) return false;
-  return /<<['"]?[A-Za-z0-9_]+['"]?/.test(cmd);
+  return {
+    isHeredoc: /<<['"]?[A-Za-z0-9_]+['"]?/.test(cmd),
+    length: cmd.length,
+  };
+}
+
+function isLargeHeredocCommand(toolName: string, input: Record<string, unknown> | undefined): boolean {
+  const info = isHeredocCommand(toolName, input);
+  return info.isHeredoc && info.length >= 400;
+}
+
+function isHardBlockedHeredocCommand(toolName: string, input: Record<string, unknown> | undefined): boolean {
+  const info = isHeredocCommand(toolName, input);
+  return info.isHeredoc && info.length >= HARD_HEREDOC_CHARS;
+}
+
+function isInlineProbeBash(toolName: string, input: Record<string, unknown> | undefined): boolean {
+  if (toolName !== "bash" || !input) return false;
+  const cmd = typeof input.command === "string" ? input.command.trim() : "";
+  if (!cmd) return false;
+  return /\bpython3?\s+-c\b/.test(cmd) || /^\s*(?:cat|head|tail|sed)\b/.test(cmd);
 }
 
 export default function localContextGuardExtension(pi: ExtensionAPI) {
@@ -136,12 +158,14 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
   let lastErrorSignature = "";
   let lastCallSignature = "";
   let consecutiveSameCall = 0;
+  let consecutiveInlineProbes = 0;
 
   pi.on("session_start", () => {
     consecutiveErrors = 0;
     lastErrorSignature = "";
     lastCallSignature = "";
     consecutiveSameCall = 0;
+    consecutiveInlineProbes = 0;
   });
 
   pi.on("input", () => {
@@ -149,6 +173,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     lastErrorSignature = "";
     lastCallSignature = "";
     consecutiveSameCall = 0;
+    consecutiveInlineProbes = 0;
   });
 
   pi.on("tool_call", (event) => {
@@ -156,7 +181,16 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     if (toolName === "phase_handoff") {
       return;
     }
-    const sig = summarizeCallSignature(toolName, event.input as Record<string, unknown> | undefined);
+    const input = event.input as Record<string, unknown> | undefined;
+    if (isHardBlockedHeredocCommand(toolName, input)) {
+      return {
+        block: true,
+        reason:
+          "Local tool guard: blocked large multi-line bash heredoc (>= 1000 chars). Use the write tool for new files or edit for updating existing files and notes.md instead of bash heredocs.",
+      };
+    }
+
+    const sig = summarizeCallSignature(toolName, input);
     if (sig === lastCallSignature) {
       consecutiveSameCall += 1;
     } else {
@@ -175,13 +209,26 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
   pi.on("tool_result", (event, ctx) => {
     const toolName = String(event.toolName || "");
     if (toolName === "phase_handoff") {
+      consecutiveInlineProbes = 0;
       return;
+    }
+
+    if (isInlineProbeBash(toolName, event.input)) {
+      consecutiveInlineProbes += 1;
+    } else if (toolName === "write" || toolName === "edit" || toolName === "bash") {
+      consecutiveInlineProbes = 0;
     }
 
     const hints: string[] = [];
     if (isLargeHeredocCommand(toolName, event.input)) {
       hints.push(
         "[Local tool hint: Avoid multi-line bash heredocs. Put scripts in .py files using write or edit so you do not burn output tokens rewriting inline code.]",
+      );
+    }
+
+    if (INLINE_PROBE_STREAK_WARN > 0 && consecutiveInlineProbes >= INLINE_PROBE_STREAK_WARN && consecutiveInlineProbes % INLINE_PROBE_STREAK_WARN === 0) {
+      hints.push(
+        `[Local efficiency hint: ${consecutiveInlineProbes} consecutive inline bash/python3 -c probes. Batch remaining checks into 1 short script or move straight to writing/updating deliverables with write/edit.]`,
       );
     }
 

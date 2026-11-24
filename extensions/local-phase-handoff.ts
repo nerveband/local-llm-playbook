@@ -1,4 +1,6 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -9,12 +11,24 @@ const HIGH_CONTEXT_TOKENS = Number(process.env.PI_LOCAL_HANDOFF_TOKENS || 32000)
 const HIGH_CONTEXT_RATIO = 0.72;
 const MAX_AUTO_HANDOFFS = 3;
 
+type LocalThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+const VALID_THINKING_LEVELS = new Set<LocalThinkingLevel>([
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
+
 interface StagedHandoff {
   phaseCompleted: string;
   summary: string;
   nextTask: string;
   files: string[];
   autoContinue: boolean;
+  nextThinkingLevel?: LocalThinkingLevel;
   filePath: string;
 }
 
@@ -25,7 +39,8 @@ const PhaseHandoffParams = Type.Object({
   }),
   summary: Type.String({
     minLength: 1,
-    description: "Concise factual summary of verified results, key counts, schema details, and decisions.",
+    description:
+      "Concise factual summary including exact verified CSV column names, JSON schema keys, row counts, key decisions, and file paths so the next phase does not re-inspect input files.",
   }),
   next_task: Type.String({
     minLength: 1,
@@ -41,7 +56,47 @@ const PhaseHandoffParams = Type.Object({
       description: "True only if the user asked for hands-free automatic Phase 2 launch. Default false pauses for review.",
     }),
   ),
+  next_thinking_level: Type.Optional(
+    Type.Union(
+      [
+        Type.Literal("off"),
+        Type.Literal("minimal"),
+        Type.Literal("low"),
+        Type.Literal("medium"),
+        Type.Literal("high"),
+        Type.Literal("xhigh"),
+        Type.Literal("max"),
+      ],
+      {
+        description:
+          "Recommended thinking level for the next phase session. Use 'low' for clear implementation/UI/CSV/script building when schemas and rules are settled, 'medium' for analysis or debugging, and 'high' only for hard algorithmic or architectural problems. Omit to keep the current level.",
+      },
+    ),
+  ),
 });
+
+function normalizeThinkingLevel(value: unknown): LocalThinkingLevel | undefined {
+  if (typeof value !== "string") return undefined;
+  const candidate = value.trim().toLowerCase() as LocalThinkingLevel;
+  return VALID_THINKING_LEVELS.has(candidate) ? candidate : undefined;
+}
+
+function parseRecommendedThinkingFromMarkdown(markdown: string): LocalThinkingLevel | undefined {
+  const match = markdown.match(/^## Recommended Thinking Level\s*\n\s*(off|minimal|low|medium|high|xhigh|max)\b/im);
+  return match ? normalizeThinkingLevel(match[1]) : undefined;
+}
+
+function parseNextPhaseArgs(args: string): { thinkOverride?: LocalThinkingLevel; userNotes: string } {
+  const trimmed = args.trim();
+  const match = trimmed.match(/^--think(?:=|\s+)(off|minimal|low|medium|high|xhigh|max)\b(?:\s+([\s\S]*))?$/i);
+  if (!match) {
+    return { userNotes: trimmed };
+  }
+  return {
+    thinkOverride: normalizeThinkingLevel(match[1]),
+    userNotes: (match[2] ?? "").trim(),
+  };
+}
 
 function formatHandoffMarkdown(data: Omit<StagedHandoff, "autoContinue" | "filePath">, userNotes?: string): string {
   const filesSection =
@@ -65,6 +120,10 @@ function formatHandoffMarkdown(data: Omit<StagedHandoff, "autoContinue" | "fileP
     data.nextTask.trim(),
   ];
 
+  if (data.nextThinkingLevel) {
+    lines.push("", "## Recommended Thinking Level", data.nextThinkingLevel);
+  }
+
   const extra = userNotes?.trim();
   if (extra) {
     lines.push("", "## User Adjustments", extra);
@@ -86,14 +145,45 @@ function archiveHandoffFile(cwd: string): void {
   }
 }
 
+function nextThinkSignalPath(cwd: string): string {
+  const hash = crypto.createHash("sha256").update(path.resolve(cwd)).digest("hex").slice(0, 16);
+  return path.join(os.tmpdir(), `pi-local-next-think-${hash}.txt`);
+}
+
+function writeNextThinkSignal(cwd: string, level: LocalThinkingLevel): void {
+  try {
+    fs.writeFileSync(nextThinkSignalPath(cwd), level, "utf-8");
+  } catch {
+    // Ignore temp write errors
+  }
+}
+
+function consumeNextThinkSignal(cwd: string): LocalThinkingLevel | undefined {
+  const signalPath = nextThinkSignalPath(cwd);
+  if (!fs.existsSync(signalPath)) return undefined;
+  try {
+    const raw = fs.readFileSync(signalPath, "utf-8");
+    fs.unlinkSync(signalPath);
+    return normalizeThinkingLevel(raw);
+  } catch {
+    return undefined;
+  }
+}
+
 export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
   let pendingHandoff: StagedHandoff | null = null;
   let warnedHighContext = false;
   let autoHandoffCount = 0;
 
-  pi.on("session_start", (event) => {
+  pi.on("session_start", (event, ctx) => {
     if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
       warnedHighContext = false;
+    }
+    if (event.reason === "new") {
+      const pendingLevel = consumeNextThinkSignal(ctx.cwd);
+      if (pendingLevel) {
+        pi.setThinkingLevel(pendingLevel as any);
+      }
     }
   });
 
@@ -122,6 +212,7 @@ export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
         ? params.files.map((item) => item.trim()).filter((item) => item.length > 0)
         : [];
       const autoContinue = Boolean(params.auto_continue);
+      const nextThinkingLevel = normalizeThinkingLevel(params.next_thinking_level);
       const filePath = path.join(ctx.cwd, HANDOFF_FILENAME);
 
       const markdown = formatHandoffMarkdown({
@@ -129,6 +220,7 @@ export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
         summary: params.summary,
         nextTask: params.next_task,
         files,
+        nextThinkingLevel,
       });
       fs.writeFileSync(filePath, markdown, "utf-8");
 
@@ -138,6 +230,7 @@ export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
         nextTask: params.next_task,
         files,
         autoContinue,
+        nextThinkingLevel,
         filePath,
       };
 
@@ -155,6 +248,7 @@ export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
         details: {
           filePath,
           autoContinue,
+          nextThinkingLevel,
           phaseCompleted: params.phase_completed,
         },
       };
@@ -222,32 +316,43 @@ export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("next-phase", {
-    description: "Start the staged next phase from .pi-handoff.md in a fresh session",
+    description: "Start the staged next phase from .pi-handoff.md in a fresh session (supports --think <level>)",
     handler: async (args, ctx: ExtensionCommandContext) => {
       const staged = pendingHandoff;
       const diskPath = staged?.filePath ?? path.join(ctx.cwd, HANDOFF_FILENAME);
-      const userNotes = args.trim();
+      const { thinkOverride, userNotes } = parseNextPhaseArgs(args);
 
       let promptForNewSession = "";
+      let diskThinkingLevel: LocalThinkingLevel | undefined;
       if (staged) {
         promptForNewSession = formatHandoffMarkdown(staged, userNotes);
       } else if (fs.existsSync(diskPath)) {
         const raw = fs.readFileSync(diskPath, "utf-8").trim();
+        diskThinkingLevel = parseRecommendedThinkingFromMarkdown(raw);
         promptForNewSession = userNotes ? `${raw}\n\n## User Adjustments\n${userNotes}\n` : `${raw}\n`;
       } else {
         ctx.ui?.notify?.(`No staged handoff found at ${diskPath}.`, "error");
         return;
       }
 
+      const targetThinkingLevel = thinkOverride ?? staged?.nextThinkingLevel ?? diskThinkingLevel;
       pendingHandoff = null;
       warnedHighContext = false;
       archiveHandoffFile(ctx.cwd);
+      if (targetThinkingLevel) {
+        writeNextThinkSignal(ctx.cwd, targetThinkingLevel);
+      }
 
       const currentSessionFile = ctx.sessionManager.getSessionFile();
       const result = await ctx.newSession({
         parentSession: currentSessionFile,
         withSession: async (newCtx) => {
-          newCtx.ui?.notify?.("Started next phase in a fresh session.", "info");
+          newCtx.ui?.notify?.(
+            targetThinkingLevel
+              ? `Started next phase in a fresh session (thinking: ${targetThinkingLevel}).`
+              : "Started next phase in a fresh session.",
+            "info",
+          );
           if (newCtx.isIdle()) {
             await newCtx.sendUserMessage(promptForNewSession);
           } else {
@@ -257,6 +362,7 @@ export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
       });
 
       if (result.cancelled) {
+        consumeNextThinkSignal(ctx.cwd);
         ctx.ui?.notify?.("Next-phase switch cancelled. Staged notes remain in .pi-handoff.last.md.", "info");
       }
     },
