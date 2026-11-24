@@ -198,9 +198,16 @@ test("local-critic parser, PII-free bundle collection, meter helpers, and trace 
   withTempDir((dir) => {
     fs.mkdirSync(path.join(dir, "DataExport-2026-11-21"));
     fs.writeFileSync(path.join(dir, "DataExport-2026-11-21", "secret.csv"), "Name,Email\nAlice,a@example.com\n");
-    fs.writeFileSync(path.join(dir, "tool.py"), "def ok():\n    return 1\n");
+    fs.writeFileSync(path.join(dir, "tool.py"), `def ok():\n    return 1\n# ${"x".repeat(7000)}\n`);
+    fs.writeFileSync(path.join(dir, "app.js"), "console.log('ready');\n");
+    fs.writeFileSync(path.join(dir, "view.html"), "<html><body>ok</body></html>\n");
+    fs.writeFileSync(path.join(dir, "style.css"), "body { color: #111; }\n");
     const bundle = collectCriticBundle(dir);
-    assert.ok(bundle.includes("tool.py"));
+    assert.ok(bundle.includes("Workspace inventory"));
+    assert.ok(bundle.includes("### tool.py"));
+    assert.ok(bundle.includes("### app.js"));
+    assert.ok(bundle.includes("### view.html"));
+    assert.ok(bundle.includes("### style.css"));
     assert.ok(!bundle.includes("Alice"), "Must never leak CSV data rows into critic bundle");
   });
 

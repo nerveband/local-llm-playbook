@@ -36,13 +36,13 @@ You get an interactive menu with live status:
 
 ```text
 pi-local: choose local model
-  1) Inkling 2 Mini (128K, port 18089)   [running]
-  2) Ornith 1.5 35B-A3B (port 8000)      [stopped]
-  3) Surogate 3.7 Flash (128K, port 18091) [stopped]
+  1) Inkling 2 Mini (128K, port 18089, oMLX + suffix_policy) [stopped]
+  2) Ornith 1.5 35B-A3B (Splash DFlash2 + int8 KV, port 18092) [stopped]
+  3) Surogate 3.7 Flash (Splash DFlash2 + int8 KV, port 18091) [stopped]
   4) Stop all local models and exit
 ```
 
-Picking `1`, `2`, or `3` automatically quits any competing model server if active, starts the chosen model server (`inkling-omlx`, `oMLX.app`, or `surogate-splash`) if stopped, waits until ready, and launches Pi cleanly. Inside Pi, switch thinking anytime with `/thinking` (or `Shift+Tab`).
+Picking `1`, `2`, or `3` automatically quits any competing model server if active, starts the chosen model server (`inkling-omlx`, `ornith-splash`, or `surogate-splash`) if stopped, waits until ready, and launches Pi cleanly. Inside Pi, switch thinking anytime with `/thinking` (or `Shift+Tab`).
 
 ### Direct shortcut flags (skip picker)
 
@@ -55,8 +55,9 @@ pi-local --ornith --no-think
 pi-local --surogate
 pi-local --surogate --bare
 pi-local --inkling --subagents
+pi-local --inkling --preflight --goal-gate --adaptive-think --trace
 
-# Stop all local servers (ports 18089, 18091, 8000) to free all GPU RAM
+# Stop all local servers (ports 18089, 18091, 18092, 8000) to free all GPU RAM
 pi-local --stop-all
 
 # Skip auto stop/start or inspect resolved flags without launching
@@ -75,17 +76,32 @@ pi-local --surogate --print-cmd
 ## Included files
 
 - [`bin/pi-local`](bin/pi-local): Interactive picker + auto server lifecycle manager + lean Pi launcher (`pi-local --help`).
-- [`extensions/local-omlx-meter.ts`](extensions/local-omlx-meter.ts): Phase-aware per-turn timer and **oMLX** telemetry speedometer.
-- [`extensions/local-context-guard.ts`](extensions/local-context-guard.ts): Prefix-cache-safe tool output trimmer (with disk spill), `sha256` exact-call loop guard, and heredoc/failure hints.
+- [`bin/pi-preflight`](bin/pi-preflight): Zero-PII workspace schema profiler with bounded `distinct<=20` low-cardinality annotations for `--preflight`.
+- [`bin/pi-outline`](bin/pi-outline): Fast AST outline extractor for Python and JS/TS files (`class`, `def`, top-level symbols).
+- [`bin/pi-verify-ui`](bin/pi-verify-ui): Single-shot headless Chromium audit tool checking DOM counts, zero-size interactive controls, console errors, and page errors.
+- [`scripts/inkling-omlx`](scripts/inkling-omlx): Launches Inkling 2 Mini on `oMLX 0.8.2 + m1_overlay` (`depth=6 + suffix_policy + --m1-fast + --affine4`, port `18089`).
+- [`scripts/ornith-splash`](scripts/ornith-splash): Launches Ornith 1.5 35B-A3B on `Splash + felkhayer DFlash2` (`--kv-format int8 --verify-rows auto --expert-memory off`, port `18092`).
+- [`scripts/surogate-splash`](scripts/surogate-splash): Launches Surogate 3.7 Flash on `Splash + incoai DFlash2` (`--kv-format int8 --verify-rows auto --cached-states int8`, port `18091`).
+- [`extensions/local-omlx-meter.ts`](extensions/local-omlx-meter.ts): Phase-aware per-turn timer, prefill/tool-buffering status, adaptive thinking scaling, and calibrated Inkling float `reasoning_effort` (`0.25`/`0.50`/`0.75`/`0.99`).
+- [`extensions/local-context-guard.ts`](extensions/local-context-guard.ts): Prefix-cache-safe tool output trimmer (with disk spill), `sha256` loop guard, `ruff`/`oxlint` differential semantic lint, static `O(K^2)` loop hazard detector (`checkPythonPerfHazards`), runtime JSON cluster-skew detector (`inspectJsonClusterSkew`), and `edit`/heredoc/browser auto-repairs.
+- [`extensions/local-goal-gate.ts`](extensions/local-goal-gate.ts): Automatic end-of-turn verification against `.pi-verify.json` (`--goal-gate`) before completion.
+- [`extensions/local-critic.ts`](extensions/local-critic.ts): Fresh-context `/critic` command and `--auto-critic` end-of-task review with balanced workspace inventory.
+- [`extensions/local-trace.ts`](extensions/local-trace.ts): Unified structured JSONL event tracer (`PI_LOCAL_TRACE_FILE` / `--trace`).
 - [`extensions/local-phase-handoff.ts`](extensions/local-phase-handoff.ts): Self-triggered `phase_handoff` tool, `32K`-token speed notice, and `/next-phase` session switcher.
-- [`scripts/install-local-extensions.sh`](scripts/install-local-extensions.sh): Installs `pi-handoff` and `pi-subagents` into `~/.local/share/pi-local-extensions` and symlinks `pi-local`.
-- [`prompts/local-lean-rules.md`](prompts/local-lean-rules.md): Short system prompt rules for disk-backed state (`notes.md`), batched read-only schema checks, `read`/`edit` over `bash cat`/heredocs, direct `~/.config/skillshare/skills-shared/` path loading, `20`-line stdout cap, `phase_handoff`, and Adversarial Self-Check before finishing.
-- [`configs/pi-models-local.example.json`](configs/pi-models-local.example.json): Local provider definitions (`inkling-local` on `18089`, `omlx-local` on `8000`, `surogate-local` on `18091` with `131072` context and `32768` max output).
-- [`configs/pi-settings-local.example.json`](configs/pi-settings-local.example.json): Per-model thinking and compaction overrides for Inkling (`medium`, `reserveTokens: 36864` with `maxTokens: 32768`), Ornith (`high`, `reserveTokens: 131072`), and Surogate (`high`, `reserveTokens: 36864` with `maxTokens: 32768`).
-- [`BEST_PRACTICES.md`](BEST_PRACTICES.md): Apple Silicon memory balance, KV prefix caching, compaction math, Ornith workflow, and subagent concurrency guidelines.
+- [`configs/oxlintrc-local.json`](configs/oxlintrc-local.json): Fast `oxlint` ruleset with browser + node environments enabled for standalone UI/extension checks.
+- [`configs/pi-models-local.example.json`](configs/pi-models-local.example.json): Local provider definitions (`inkling-local` on `18089`, `surogate-local` on `18091`, `ornith-splash` on `18092`, legacy `omlx-local` on `8000`).
+- [`configs/pi-settings-local.example.json`](configs/pi-settings-local.example.json): Per-model thinking and compaction overrides for Inkling, Ornith Splash, and Surogate Splash (`reserveTokens: 36864`, `keepRecentTokens: 12000`).
+- [`tests/harness.test.mjs`](tests/harness.test.mjs): Node unit & regression suite (`node --test tests/harness.test.mjs`).
+- [`scripts/install-local-extensions.sh`](scripts/install-local-extensions.sh): Installs `pi-handoff` and `pi-subagents` into `~/.local/share/pi-local-extensions` and symlinks CLI helpers into `~/.local/bin`.
+- [`prompts/local-lean-rules.md`](prompts/local-lean-rules.md): Short system prompt rules covering disk memory (`notes.md`), batched schema checks, `pi-verify-ui`, differential lint, blocking-vs-scoring separation, and `O(K)` union-find guards.
+- [`BEST_PRACTICES.md`](BEST_PRACTICES.md): Engine A/B micro-benchmarks, Before-vs-After 3-model benchmarks, memory balance, KV prefix caching, and Split GDN `--slots 1` tradeoffs.
 - [`PROMPTS.md`](PROMPTS.md): Copy-paste prompts for large tabular datasets, refactors, mid-session nudges, and phase transitions.
 
 ## Changelog
+
+- `2026-11-24` (full Tier 1 to 3 engine + harness overhaul & 3-model verification):
+  - **Engine upgrades:** Built `ornith-splash` (native `felkhayer/Ornith-1.5-35B-A3B-DFlash2-Splash` + `--kv-format int8 --verify-rows auto`, eliminating `61%` disk expert streaming and hitting up to `142.1 tok/s` decode); upgraded `surogate-splash` to `--verify-rows auto --kv-format int8` (`+19.1%` micro-benchmark throughput and `-23.9%` faster end-to-end run with zero compaction past `80K`); upgraded `inkling-omlx` to `oMLX 0.8.2 + m1_overlay` (`depth=6 + suffix_policy + --m1-fast + --affine4`) with calibrated float `reasoning_effort` (`0.25`/`0.50`/`0.75`/`0.99`). Audited `hackafterdark/phosphor`, `dangxingyu/megakernel-zoo`, and `qwegnai/qwegn` v0.36.0 (`kernel_std.metallib` Apple7 support confirmed; requires `.qwg` pack).
+  - **Harness & verification upgrades:** Added `pi-preflight` (with zero-PII bounded `distinct<=20` low-cardinality column annotations), `pi-outline`, `pi-verify-ui`, `local-goal-gate.ts`, `local-critic.ts` (async lifecycle fix, balanced inventory + head/tail snippets), `local-trace.ts`, differential `ruff`/`oxlint` checks via `configs/oxlintrc-local.json`, static `O(K^2)` Python loop hazard detection (`checkPythonPerfHazards`), runtime JSON cluster-skew detection (`inspectJsonClusterSkew`), `--adaptive-think`, and `pi-hashline-edit@0.8.4`. Verified `9/9` unit tests passing and full end-to-end 3-model completions across Ornith (`36m 19s`, `16/16` PASS), Surogate (`22m 26s`, `-23.9%` vs baseline, `16/16` deliverables PASS), and Inkling (`7m 41s` P1 = `-44.2%`, `20m 30s` pre-critic / `33m 24s` post-critic, PASS).
 
 - `2026-11-23` (post-benchmark harness hardening): Added premature/empty-stop auto-continue (`agent_end`, max `2` retries when no `.pi-handoff.md` is staged), XML `<oldText>` and Python `"""..."""` stringified `edit` repairs, multi-edit `edits[N]` closest-line hints, `6+` micro `agent-browser eval` batching nudge, `session_shutdown` leftover `agent-browser` session cleanup, `>= 60s` slow-`bash` `O(K^2)`/mega-cluster hint, `omlx-local` `temp 0.65` / `top_p 0.95` / `top_k 20` injection in `local-omlx-meter.ts`, `pkill -TERM -x oMLX` fallback in `bin/pi-local` `stop_ornith()`, and clustering guard Rule `11` in `prompts/local-lean-rules.md`.
 - `2026-11-23` (harness upgrade): Added `message_end` auto-repairs (stringified `edit.edits` and `edits[i]` JSON parsing, snake_case edit field normalization, unique CRLF/trimmed-line whitespace block matching, and macOS GNU `timeout` stripping), post-`write`/`edit` automatic `py_compile` / `node --check` syntax checks, `edit` closest-line hints, repeated verify-script `agent-browser` headless Chromium nudges + Rules `9` and `10` in `prompts/local-lean-rules.md`, and per-request **Splash** `thinking_token_budget` scaling (`minimal: 512`, `low: 1024`, `medium: 1536`, `high: 2048`, `xhigh: 4096`) in `local-omlx-meter.ts` and `surogate-local` `thinkingLevelMap`.

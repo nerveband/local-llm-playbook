@@ -6,9 +6,14 @@ Living field guide for keeping local coding and data-analysis sessions fast, acc
 
 ## 1. Hardware and Memory Budget (64 GiB M1 Max)
 
-- **Inkling 2 Mini (`128K` context, `--slots 1`, `--hot-cache-max-size 6GB`, `--default-temp 0.6 --top-p 0.95 --repetition-penalty 1.0` on port `18089`):**
-  - Active model + `64K` KV peak measured `24.39 GB` GPU RAM (`31,712` KV tokens add only `+0.91 GB` across `8` full-attention layers with `1024` sliding-window attention).
-  - Use `--default-temp 0.6 --top-p 0.95 --repetition-penalty 1.0` instead of greedy `0.0` or `0.2`: low temperatures on looped MoE models can lock into verbatim copy loops across blocked commands, whereas keeping `repetition_penalty: 1.0` and `presence_penalty: 0.0` preserves code syntax and `<think>` logic.
+- **Inkling 2 Mini (`128K` context, `oMLX 0.8.2 + m1_overlay`, `depth=6 + suffix_policy + --m1-fast + --affine4`, `--slots 1`, `--hot-cache-max-size 6GB`, `--default-temp 0.6 --top-p 0.95 --repetition-penalty 1.0` on port `18089`):**
+  - Calibrated float `reasoning_effort` (`low: "0.25"`, `medium: "0.50"`, `high: "0.75"`, `xhigh/max: "0.99"`) replaces `"medium"` (`0.7`) so simple turns avoid excessive thinking tokens while retaining MTP speedup (`40.0 tok/s` micro-benchmark overall, up to `78.6 tok/s` live turn decode).
+  - Measured `depth=6 + suffix_policy` outperformed `depth=8`, `depth=10`, and vanilla `oMLX 0.8.3` (`no m1_overlay`), while `fp8_kv_full` on `0.8.2` broke MTP acceptance (`0/510`) and is intentionally omitted.
+- **Ornith 1.5 35B-A3B (`ornith-splash` port `18092`, `Splash` + `felkhayer/Ornith-1.5-35B-A3B-DFlash2-Splash`, `--kv-format int8 --verify-rows auto --expert-memory off --language-only --thinking-token-budget 2048`):**
+  - Replaces legacy desktop `oMLX.app` (`61%` disk expert streaming) with zero disk streaming, reaching `93.9 overall tok/s` in micro-benchmarks and up to `142.1 tok/s` (`13.8 tok/cycle`) in live Phase 2 runs (`36m 19s`, `16/16` deliverables PASS vs incomplete baseline crash).
+  - Ensure `~/.pi/agent/settings.json` includes `ornith-splash/ornith` under `compaction.modelOverrides` (`reserveTokens: 36864`, `keepRecentTokens: 12000`) so `pi` does not fall back to the `65536` global reserve and compact prematurely at `65K`.
+- **Surogate 3.7 Flash (`surogate-splash` port `18091`, `Splash` + `incoai/Qwen3.6-35B-A3B-DFlash2`, `--kv-format int8 --verify-rows auto --cached-states int8 --expert-memory off --language-only --thinking-token-budget 2048`):**
+  - Upgrading from `verify=all, kv=bf16` to `verify=auto, kv=int8` boosted micro-benchmark throughput by `+19.1%` (`29.9` → `35.6 overall tok/s`) and cut end-to-end 2-phase runtime by `-23.9%` (`29m 28s` → `22m 26s`) with zero compaction up to `80.6K` context.
 
 ### Qwen 3.8 27B + Inkling 2 Mini Sampling Lesson
 
@@ -82,6 +87,7 @@ Hybrid architectures using sliding-window attention and recurrent GDN layers req
 - **oMLX `0.8.2` prefix-cache caveats observed in practice:**
   - Rare large `write` tool calls (`10K`+ tokens) can diverge on the next turn inside the replayed tool-call JSON if **oMLX** re-serializes keys or escaping differently from what the model originally generated (`dictsort` + `tojson` in Jinja templates). Keep written Python scripts concise (`250` to `350` lines) and patch iteratively with `edit` so even a rare replay mismatch re-prefills only `2K` to `3K` tokens instead of `14K`+.
   - On fresh-session Turn 1 (after `/next-phase`), **oMLX `0.8.2`** may still re-prefill the full Turn-1 prompt (`reused 0`) even when the first `~5,600` system/tools tokens match an earlier session, because of its shared-tail cache cutoff.
+  - **Split GDN checkpoint eviction with `--auto-critic` on `--slots 1`:** Sending an out-of-band `--auto-critic` completion request to `inkling-omlx` (`--slots 1`) writes a separate critic sequence and invalidates the active session's Split GDN recurrent checkpoint, triggering ~`180 s` (`~50K`-token) cold re-prefills on post-critic turns. Keep `--auto-critic` for Splash models (`ornith-splash`, `surogate-splash`) or manual final `/critic` runs rather than mid-stream single-slot Inkling sessions.
 
 ---
 
@@ -135,4 +141,17 @@ To eliminate those multi-turn retry loops automatically without mutating prior K
    - **`edit` anchor line hint & `agent-browser` nudges:** Reports the nearest matching line number (suggesting `write` for files `<= 150` lines) on both single-edit and `edits[N]` misses, redirects repeated stub failures toward real headless Chromium (`agent-browser`), nudges batching after `>= 6` consecutive single-assertion `agent-browser eval` calls, warns on `>= 60s` slow `bash` commands (`O(K^2)` / mega-cluster check), and closes leftover tracked `agent-browser` sessions on `session_shutdown`.
    - **Premature-stop auto-continue (`agent_end`):** Detects when a session stalls mid-task (`stop` / `length` with `0` tool calls and either empty visible text after thinking or a short `:` / `"Let me ..."` intent stub) when no `.pi-handoff.md` is staged, and injects up to `2` follow-up nudges automatically so multi-step builds finish completely.
    - **Per-model sampling guard (`local-omlx-meter.ts`):** Injects `temperature: 0.65`, `top_p: 0.95`, `top_k: 20` on both `surogate-local` and `omlx-local` when unset to prevent `temperature: 1.0` tool-JSON drift on desktop **oMLX** / **Splash**, while `pi-local` `stop_ornith()` falls back cleanly to `pkill -TERM -x oMLX` if AppleEvents quit times out.
-3. **Future exploration:** Hashline (line-hash-anchored edits) as a lightweight optional editing mode if larger (`> 300`-line) files still incur exact-match misses.
+3. **Static & runtime anti-pattern guards (`local-context-guard.ts` + `pi-preflight`):**
+   - `pi-preflight` profiles workspace CSVs with zero row leakage and annotates low-cardinality columns (`distinct<=20` on `>= 100` rows) upfront so union-find logic never groups on statuses, types, or dates.
+   - `checkPythonPerfHazards` inspects newly written or edited `.py` scripts immediately for unguarded `O(K^2)` `range(len(x))` pair loops before execution, while `inspectJsonClusterSkew` flags newly generated `.json` cluster outputs whose largest bucket exceeds `100` items (or `>= 50` on slow runs).
+   - Paired with `pi-verify-ui` (single-shot headless Chromium audit) and `local-goal-gate.ts` (`.pi-verify.json`), silent UI/clustering bugs fail cleanly in seconds instead of stalling multi-minute local turns.
+
+---
+
+## 9. Engine & 2-Phase End-to-End Benchmark Results (M1 Max 64 GiB)
+
+| Model | Baseline Time | Optimized Time | Avg / Max Decode | Phase 1 / Phase 2 | Errors | Final Outcome |
+| --- | --- | --- | --- | --- | --- | --- |
+| Ornith 1.5 35B-A3B | `20m 45s` (incomplete) | `36m 19s` | `68.8` / `142.1 tok/s` | `16m 40s` / `19m 39s` | `8` (vs `9`) | `16/16` PASS (`1,157` groups, `1,045` high), `goal_gate` + `auto_critic` PASS |
+| Surogate 3.7 Flash | `29m 28s` | `22m 26s` (`-23.9%`) | `72.2` / `130.9 tok/s` | `8m 14s` / `14m 12s` | `9` (vs `11`) | `16/16` deliverables PASS, `0` compactions up to `80.6K`, `goal_gate` PASS |
+| Inkling 2 Mini | `25m 04s` | `20m 30s` pre-critic (`33m 24s` total) | `47.5` / `65.6 tok/s` | `7m 41s` (`-44.2%`) / `12m 49s` pre-critic | `1` (vs `6`) | Deliverables PASS (`835` groups, `344` high, `maxSize 46`), `pi-verify-ui` PASS, `0` hangs |

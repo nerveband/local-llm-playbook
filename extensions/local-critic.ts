@@ -28,18 +28,17 @@ function resolveCriticEndpoint(ctx: ExtensionContext): { url: string; model: str
   };
 }
 
-/** Collect compact workspace file list + code snippets + git diff with zero CSV data rows. */
+/** Collect PII-free workspace inventory + balanced code excerpts + git diff with zero CSV data rows. */
 export function collectCriticBundle(cwd: string): string {
   const sections: string[] = [];
-  const files: string[] = [];
-  const codeSnippets: string[] = [];
-  let charBudget = MAX_CODE_CHARS;
+  const inventory: string[] = [];
+  const codeCandidates: { rel: string; raw: string }[] = [];
 
   function walk(dir: string, depth: number): void {
     if (depth > 2) return;
     let entries: fs.Dirent[];
     try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
+      entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
     } catch {
       return;
     }
@@ -48,20 +47,20 @@ export function collectCriticBundle(cwd: string): string {
       const full = path.join(dir, ent.name);
       const rel = path.relative(cwd, full);
       if (ent.isDirectory()) {
-        files.push(`${rel}/`);
+        inventory.push(`- ${rel}/`);
         walk(full, depth + 1);
       } else {
-        files.push(rel);
+        let sizeBytes = 0;
+        try {
+          sizeBytes = fs.statSync(full).size;
+        } catch {
+          // Keep 0 byte fallback if stat fails.
+        }
+        inventory.push(`- ${rel} (${sizeBytes} bytes)`);
         const ext = path.extname(ent.name).toLowerCase();
-        if (CODE_EXTS.has(ext) && charBudget > 500) {
+        if (CODE_EXTS.has(ext) && sizeBytes > 0 && sizeBytes <= 64000) {
           try {
-            const st = fs.statSync(full);
-            if (st.size <= 64000) {
-              const raw = fs.readFileSync(full, "utf-8");
-              const slice = raw.slice(0, Math.min(3500, charBudget));
-              codeSnippets.push(`### ${rel}\n\`\`\`\n${slice}\n\`\`\``);
-              charBudget -= slice.length;
-            }
+            codeCandidates.push({ rel, raw: fs.readFileSync(full, "utf-8") });
           } catch {
             // Skip unreadable file.
           }
@@ -71,7 +70,7 @@ export function collectCriticBundle(cwd: string): string {
   }
 
   walk(cwd, 0);
-  sections.push(`Files on disk:\n${files.slice(0, 60).map((f) => `- ${f}`).join("\n")}`);
+  sections.push(`Workspace inventory (authoritative list of files on disk):\n${inventory.slice(0, 80).join("\n")}`);
 
   try {
     const promptPath = path.join(cwd, "PROMPT.md");
@@ -97,8 +96,26 @@ export function collectCriticBundle(cwd: string): string {
     // Workspace might not be a git repository.
   }
 
-  if (codeSnippets.length > 0) {
-    sections.push(codeSnippets.join("\n\n"));
+  if (codeCandidates.length > 0) {
+    const codeSnippets: string[] = [];
+    const perFileBudget = Math.max(1200, Math.floor(MAX_CODE_CHARS / codeCandidates.length));
+    let charBudget = MAX_CODE_CHARS;
+    for (const item of codeCandidates) {
+      if (charBudget < 400) break;
+      const cap = Math.min(perFileBudget, charBudget);
+      let slice: string;
+      if (item.raw.length <= cap) {
+        slice = item.raw;
+      } else {
+        const half = Math.max(400, Math.floor((cap - 60) / 2));
+        slice = `${item.raw.slice(0, half)}\n[... excerpt trimmed to fit critic budget ...]\n${item.raw.slice(-half)}`;
+      }
+      codeSnippets.push(`### ${item.rel}\n\`\`\`\n${slice}\n\`\`\``);
+      charBudget -= slice.length;
+    }
+    if (codeSnippets.length > 0) {
+      sections.push(codeSnippets.join("\n\n"));
+    }
   }
 
   return sections.join("\n\n");
@@ -142,6 +159,7 @@ async function runFreshCritic(ctx: ExtensionContext, focus: string): Promise<{ p
   const prompt = [
     "You are an independent, strict code reviewer in a clean context.",
     "CRITICAL: You have NO tools available. Do NOT output <tool_call>, <function=...>, XML tags, or requests to read files. Inspect ONLY the workspace listing and code provided below.",
+    "Do NOT flag any file listed in 'Workspace inventory' as missing or absent solely because its excerpt below was trimmed to fit the critic budget.",
     focus ? `Review focus: ${focus}` : "Inspect for concrete bugs, missing deliverables, bad DOM selectors, O(K^2) performance risks, or unhandled errors.",
     "Do NOT invent minor style complaints. Respond ONLY with raw JSON: {\"pass\": true, \"defects\": []} if solid, or {\"pass\": false, \"defects\": [\"...\"]} with up to 5 concrete defects.",
     "",
