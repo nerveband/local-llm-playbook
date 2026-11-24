@@ -657,22 +657,13 @@ if [[ "$USE_RULES" == "1" && -f "$REPO_DIR/prompts/local-lean-rules.md" ]]; then
   ARGS+=(--append-system-prompt "$REPO_DIR/prompts/local-lean-rules.md")
 fi
 
-PREFLIGHT_TMP=""
-cleanup_preflight() {
-  if [[ -n "$PREFLIGHT_TMP" && -f "$PREFLIGHT_TMP" ]]; then
-    rm -f "$PREFLIGHT_TMP" 2>/dev/null || true
-  fi
-}
-trap cleanup_preflight EXIT INT TERM
-
 if [[ "$USE_PREFLIGHT" == "1" ]] && [[ -x "$REPO_DIR/bin/pi-preflight" ]]; then
   if [[ "$PRINT_CMD" == "1" ]]; then
-    ARGS+=(--append-system-prompt "<workspace_preflight_tmp>")
+    ARGS+=(--append-system-prompt "<workspace_preflight_snapshot>")
   else
-    PREFLIGHT_TMP=$(mktemp -t pi-preflight.XXXXXX)
-    "$REPO_DIR/bin/pi-preflight" "$PWD" >"$PREFLIGHT_TMP" 2>/dev/null || true
-    if [[ -s "$PREFLIGHT_TMP" ]]; then
-      ARGS+=(--append-system-prompt "$PREFLIGHT_TMP")
+    PREFLIGHT_TEXT=$("$REPO_DIR/bin/pi-preflight" "$PWD" 2>/dev/null || true)
+    if [[ -n "$PREFLIGHT_TEXT" ]]; then
+      ARGS+=(--append-system-prompt "$PREFLIGHT_TEXT")
     fi
   fi
 fi
@@ -738,8 +729,4 @@ if [[ "$PRINT_CMD" == "1" ]]; then
   exit 0
 fi
 
-if [[ -n "$PREFLIGHT_TMP" ]]; then
-  pi "${ARGS[@]}" "$@"
-  exit $?
-fi
 exec pi "${ARGS[@]}" "$@"

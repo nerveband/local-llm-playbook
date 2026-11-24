@@ -65,10 +65,10 @@ def main() -> int:
     # CSV schemas (headers + row count ONLY — zero row values for privacy)
     if csv_files:
         lines.append("csv_schemas (headers + row counts only):")
-        for csv_path in csv_files[:10]:
+        for csv_path in csv_files[:12]:
             rel = csv_path.relative_to(cwd)
             cols, count = count_csv_rows(csv_path)
-            lines.append(f"- {rel}: {count} rows, {len(cols)} cols -> {json.dumps(cols)}")
+            lines.append(f"- {rel}: {count} rows, {len(cols)} cols -> {', '.join(cols)}")
 
     pkg = cwd / "package.json"
     if pkg.is_file():
