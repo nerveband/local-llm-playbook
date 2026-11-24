@@ -1,0 +1,156 @@
+#!/bin/zsh
+set -eu
+
+ROOT="/Users/nerveband/Documents/Codex/2026-11-21/files-pasted-by-the-user-find"
+LAB="$ROOT/work/lab"
+MODELS="/Volumes/Extreme SSD/Models/Inkling-2-Mini"
+SYSTEM_APP="/Applications/oMLX.app"
+DMG="$MODELS/hf-cache/oMLX-0.8.2-macos26-27.dmg"
+MOUNT="$ROOT/work/mount-omlx-live"
+STATE="$ROOT/work/inkling-omlx-live"
+PIDFILE="$STATE/server.pid"
+LOGFILE="$STATE/server.log"
+URL="http://127.0.0.1:18089"
+
+is_serving() {
+  curl -sf --max-time 2 "$URL/v1/models" 2>/dev/null | /opt/homebrew/bin/python3.12 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    sys.exit(0 if any(m.get("id") == "inkling" for m in data.get("data", [])) else 1)
+except Exception:
+    sys.exit(1)
+'
+}
+
+cleanup_mount() {
+  if [[ -d "$MOUNT" ]]; then
+    if hdiutil info | grep -Fq "$MOUNT"; then
+      hdiutil detach "$MOUNT" -quiet 2>/dev/null || hdiutil detach -force "$MOUNT" -quiet 2>/dev/null || true
+    fi
+    rmdir "$MOUNT" 2>/dev/null || true
+  fi
+}
+
+stop_server() {
+  local pid=""
+  if [[ -f "$PIDFILE" ]]; then
+    pid=$(cat "$PIDFILE" 2>/dev/null || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      for _ in {1..30}; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+    fi
+    rm -f "$PIDFILE"
+  fi
+  if pgrep -f -- "--base-path $STATE/state" >/dev/null 2>&1; then
+    pkill -TERM -f -- "--base-path $STATE/state" 2>/dev/null || true
+    sleep 1
+    pkill -KILL -f -- "--base-path $STATE/state" 2>/dev/null || true
+  fi
+  cleanup_mount
+}
+
+resolve_app() {
+  local ver=""
+  if [[ -f "$SYSTEM_APP/Contents/Info.plist" ]]; then
+    ver=$(defaults read "$SYSTEM_APP/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || true)
+  fi
+  if [[ "$ver" == "0.8.2" ]]; then
+    print -r -- "$SYSTEM_APP"
+    return 0
+  fi
+  mkdir -p "$MOUNT"
+  if ! hdiutil info | grep -Fq "$MOUNT"; then
+    hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" "$DMG" >/dev/null
+  fi
+  print -r -- "$MOUNT/oMLX.app"
+}
+
+case "${1:-}" in
+  start)
+    if is_serving; then
+      print "inkling-omlx is already running on $URL (oMLX 0.8.2, M1-fast v2 + suffix_policy + affine4)"
+      exit 0
+    fi
+    stop_server
+    mkdir -p "$STATE"
+    APP_PATH=$(resolve_app)
+    nohup /opt/homebrew/bin/python3.12 -u "$LAB/serve_omlx.py" \
+      --app "$APP_PATH" \
+      --weights "$MODELS/omlx-oq4" \
+      --state "$STATE/state" \
+      --cache "$STATE/kv" \
+      --depth 6 --context 131072 --slots 1 --features sort32,caps,m1_attn,verify_compile,split_in_proj,skip_lm_head,fast_decode,fast_greedy,prefill_pad64,verify_flush,m1_qmv_moe,predraft_fix,dspark_2bit,draft4,fuse_draft_qkv,bounded_cache,bf16_loop_ctrl,prefill_fast,ttft_fixes,suffix_policy --affine4 \
+      --hot-cache-max-size 6GB --default-temp 0.6 --top-p 0.95 --repetition-penalty 1.0 \
+      >"$LOGFILE" 2>&1 </dev/null &!
+    pid=$!
+    print -r -- "$pid" >"$PIDFILE"
+
+    ready=0
+    for _ in {1..120}; do
+      if is_serving; then
+        ready=1
+        break
+      fi
+      if ! kill -0 "$pid" 2>/dev/null; then
+        print -u2 "inkling-omlx failed to start; recent log:"
+        tail -n 30 "$LOGFILE" >&2 || true
+        stop_server
+        exit 1
+      fi
+      sleep 0.5
+    done
+    if [[ "$ready" != "1" ]]; then
+      print -u2 "Timed out waiting for $URL/v1/models"
+      tail -n 30 "$LOGFILE" >&2 || true
+      stop_server
+      exit 1
+    fi
+
+    print "Server is up on $URL (runtime: $APP_PATH); loading Inkling 2 Mini (affine4 M1-fast)..."
+    curl -sf --max-time 180 "$URL/v1/chat/completions" \
+      -H "Content-Type: application/json" \
+      -d '{"model":"inkling","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":1,"temperature":0}' \
+      >/dev/null
+    print "Ready and loaded: $URL (model: inkling, depth 6, context 131072, hot-cache 6GB)"
+    ;;
+  stop)
+    stop_server
+    print "Stopped inkling-omlx on $URL"
+    ;;
+  status)
+    pid=""
+    [[ -f "$PIDFILE" ]] && pid=$(cat "$PIDFILE" 2>/dev/null || true)
+    if is_serving; then
+      loaded="not yet warmed"
+      if [[ -f "$LOGFILE" ]] && grep -q "BENCH affine expert conversion complete" "$LOGFILE"; then
+        loaded="loaded and affine4-warmed"
+      fi
+      print "running (pid=${pid:-unknown}, url=$URL, model=inkling, $loaded)"
+      exit 0
+    fi
+    print "stopped"
+    exit 1
+    ;;
+  logs)
+    shift || true
+    if [[ ! -f "$LOGFILE" ]]; then
+      print -u2 "No log file at $LOGFILE"
+      exit 1
+    fi
+    if [[ "${1:-}" == "-f" ]]; then
+      exec tail -f "$LOGFILE"
+    fi
+    tail -n "${1:-50}" "$LOGFILE"
+    ;;
+  *)
+    print -u2 "Usage: inkling-omlx start | stop | status | logs [-f|lines]"
+    exit 2
+    ;;
+esac
