@@ -6,9 +6,20 @@ Living field guide for keeping local coding and data-analysis sessions fast, acc
 
 ## 1. Hardware and Memory Budget (64 GiB M1 Max)
 
-- **Inkling 2 Mini (`128K` context, `--slots 1`, `--hot-cache-max-size 6GB`, `--default-temp 0.2` on port `18089`):**
+- **Inkling 2 Mini (`128K` context, `--slots 1`, `--hot-cache-max-size 6GB`, `--default-temp 0.6 --top-p 0.95 --repetition-penalty 1.0` on port `18089`):**
   - Active model + `64K` KV peak measured `24.39 GB` GPU RAM (`31,712` KV tokens add only `+0.91 GB` across `8` full-attention layers with `1024` sliding-window attention).
-  - Use `--default-temp 0.2` instead of `0.0`: pure greedy decoding (`0.0`) on local MoE models can lock into repeating identical tool calls or identical thinking traces, whereas `0.2` keeps code generation accurate while breaking repetition loops.
+  - Use `--default-temp 0.6 --top-p 0.95 --repetition-penalty 1.0` instead of greedy `0.0` or `0.2`: low temperatures on looped MoE models can lock into verbatim copy loops across blocked commands, whereas keeping `repetition_penalty: 1.0` and `presence_penalty: 0.0` preserves code syntax and `<think>` logic.
+
+### Qwen 3.8 27B + Inkling 2 Mini Sampling Lesson
+
+Both Inkling 2 Mini (looped 24-layer MoE transformer) and dense/thinking coding models such as Qwen 3.8 27B rely on unconstrained token distributions inside `<think>` traces and structured code syntax:
+
+- **Keep `repetition_penalty: 1.0` (disabled) and `presence_penalty: 0.0` during thinking mode.** Multiplicative repetition penalties (`> 1.0`) penalize repeated brackets, variable names, boilerplate syntax, and JSON/XML tool delimiters, which breaks syntax and degrades `<think>` chains.
+- **Recommended per-mode defaults:**
+  - **Inkling 2 Mini (`oMLX`):** `--default-temp 0.6`, `--top-p 0.95`, `top_k: 0`, `--repetition-penalty 1.0`, `presence_penalty: 0.0` (matches `temp 0.6` / `top_p 0.95` stability without greedy copy loops).
+  - **Qwen 3.8 27B (Thinking mode):** `temperature: 1.0`, `top_p: 0.95`, `top_k: 20`, `repetition_penalty: 1.0`, `presence_penalty: 0.0` (with `preserve_thinking` kept enabled across turns).
+  - **Qwen 3.8 27B (Non-thinking Instruct mode):** `temperature: 0.7`, `top_p: 0.80`, `top_k: 20`, `presence_penalty: 1.5`, `repetition_penalty: 1.0`.
+- **Pair sampling with harness checks:** Use the **Adversarial Self-Check** rule in `prompts/local-lean-rules.md` to counter author confirmation bias, and count repeats even on blocked heredocs in `local-context-guard.ts`.
   - Inkling supports 7 native `reasoning_effort` levels in `chat_template.jinja`:
 
 | Pi thinking level | Sent `reasoning_effort` | Numeric effort | Notes |
@@ -50,7 +61,7 @@ Instead of letting a single long run hit emergency compaction, let the model swi
 
 - `extensions/local-phase-handoff.ts` gives the model a `phase_handoff` tool that writes `.pi-handoff.md` with the completed summary (including exact verified column names and JSON schema keys), key files on disk (`notes.md`, scripts, JSON outputs), an optional `next_thinking_level` recommendation (`low` for straightforward UI/CSV/script builds, `medium` for analysis or debugging), and the exact next-phase task.
 - At `32,000` tokens (or `72%` of the window, whichever comes first), a `tool_result` notice whispers once to the model to wrap up `notes.md` and call `phase_handoff` at the next milestone before long-context decode slows down.
-- `extensions/local-context-guard.ts` trims oversized noisy `bash`/`grep`/`find`/`ls` (`>6,000` chars / `120` lines), explicit `sed -n` line-range slices (`>12,000` chars / `220` lines), and `read` (`>20,000` chars / `400` lines) outputs at insertion time while keeping skill/reference/instruction docs (`SKILL.md`, `notes.md`, `PROMPT.md`, `/skills*/`, `/reference/*.md`) intact up to `36,000` chars and spilling trimmed logs to `/tmp/pi-local-tool-logs` so context grows slowly without mutating prior history. It also hashes full tool-call inputs with `sha256` to catch non-error loops (warns on the `2nd` identical call in a row, blocks the `3rd` identical call via `tool_call`), hard-blocks `>= 1,000`-char `bash` heredocs so models use `write`/`edit`, warns on `400` to `999`-char heredocs, and nudges after `3` consecutive inline `python3 -c` probes.
+- `extensions/local-context-guard.ts` trims oversized noisy `bash`/`grep`/`find`/`ls` (`>6,000` chars / `120` lines), explicit `sed -n` line-range slices (`>12,000` chars / `220` lines), and `read` (`>20,000` chars / `400` lines) outputs at insertion time while keeping skill/reference/instruction docs (`SKILL.md`, `notes.md`, `PROMPT.md`, `/skills*/`, `/reference/*.md`) intact up to `36,000` chars and spilling trimmed logs to `/tmp/pi-local-tool-logs` so context grows slowly without mutating prior history. It also hashes every tool call with `sha256` before blocking checks (catching repeated blocked calls too: warns on the `2nd` identical call in a row, escalates on repeated blocked heredocs, blocks the `3rd` identical call via `tool_call`), allows `cat >> notes.md` heredoc appends up to `2,500` chars while hard-blocking other `>= 1,000`-char `bash` heredocs, warns on `400` to `999`-char heredocs, and emits separate nudges after `3` consecutive inline `python3 -c` probes vs `3` consecutive shell `cat`/`head`/`tail`/`sed` reads.
 - **Two modes controlled by `auto_continue` (and per-phase thinking switching):**
   - `auto_continue: false` (default): Model writes `.pi-handoff.md`, stops calling tools, and waits so you can inspect deliverables and run `/next-phase` (or `/next-phase --think low`) when ready.
   - `auto_continue: true`: When you want hands-free execution across phases, `agent_end` automatically runs `/next-phase` (`ctx.newSession`), switches thinking via `pi.setThinkingLevel()` cleanly at session Turn 0 when `next_thinking_level` is set, and starts the next phase in a fresh window without filling context (capped at `3` auto-hops per run for loop safety).

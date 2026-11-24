@@ -125,6 +125,7 @@ function summarizeCallSignature(toolName: string, input: Record<string, unknown>
 }
 
 const HARD_HEREDOC_CHARS = Number(process.env.PI_LOCAL_HARD_HEREDOC_CHARS || 1000);
+const NOTES_APPEND_MAX_CHARS = Number(process.env.PI_LOCAL_NOTES_HEREDOC_CHARS || 2500);
 const INLINE_PROBE_STREAK_WARN = Number(process.env.PI_LOCAL_INLINE_PROBE_WARN || 3);
 
 function isHeredocCommand(toolName: string, input: Record<string, unknown> | undefined): { isHeredoc: boolean; length: number } {
@@ -136,21 +137,41 @@ function isHeredocCommand(toolName: string, input: Record<string, unknown> | und
   };
 }
 
+function isNotesAppendHeredoc(toolName: string, input: Record<string, unknown> | undefined): boolean {
+  if (toolName !== "bash" || !input) return false;
+  const cmd = typeof input.command === "string" ? input.command : "";
+  return /^\s*cat\s+>>\s*(?:\.\/)?notes\.md\s+<<['"]?[A-Za-z0-9_]+['"]?/.test(cmd);
+}
+
 function isLargeHeredocCommand(toolName: string, input: Record<string, unknown> | undefined): boolean {
   const info = isHeredocCommand(toolName, input);
-  return info.isHeredoc && info.length >= 400;
+  if (!info.isHeredoc) return false;
+  if (isNotesAppendHeredoc(toolName, input)) return false;
+  return info.length >= 400;
 }
 
 function isHardBlockedHeredocCommand(toolName: string, input: Record<string, unknown> | undefined): boolean {
   const info = isHeredocCommand(toolName, input);
-  return info.isHeredoc && info.length >= HARD_HEREDOC_CHARS;
+  if (!info.isHeredoc) return false;
+  if (isNotesAppendHeredoc(toolName, input)) {
+    return info.length >= NOTES_APPEND_MAX_CHARS;
+  }
+  return info.length >= HARD_HEREDOC_CHARS;
 }
 
-function isInlineProbeBash(toolName: string, input: Record<string, unknown> | undefined): boolean {
+function isPythonInlineProbe(toolName: string, input: Record<string, unknown> | undefined): boolean {
+  if (toolName !== "bash" || !input) return false;
+  const cmd = typeof input.command === "string" ? input.command.trim() : "";
+  return Boolean(cmd && /\bpython3?\s+-c\b/.test(cmd));
+}
+
+function isShellReadProbe(toolName: string, input: Record<string, unknown> | undefined): boolean {
   if (toolName !== "bash" || !input) return false;
   const cmd = typeof input.command === "string" ? input.command.trim() : "";
   if (!cmd) return false;
-  return /\bpython3?\s+-c\b/.test(cmd) || /^\s*(?:cat|head|tail|sed)\b/.test(cmd);
+  if (isExplicitLineSliceCommand(toolName, input)) return false;
+  if (/(?:^|\s)(?:\.\/)?notes\.md(?:\s|$)/.test(cmd)) return false;
+  return /^\s*(?:cat|head|tail|sed)\b/.test(cmd);
 }
 
 export default function localContextGuardExtension(pi: ExtensionAPI) {
@@ -158,14 +179,16 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
   let lastErrorSignature = "";
   let lastCallSignature = "";
   let consecutiveSameCall = 0;
-  let consecutiveInlineProbes = 0;
+  let consecutivePythonProbes = 0;
+  let consecutiveShellReadProbes = 0;
 
   pi.on("session_start", () => {
     consecutiveErrors = 0;
     lastErrorSignature = "";
     lastCallSignature = "";
     consecutiveSameCall = 0;
-    consecutiveInlineProbes = 0;
+    consecutivePythonProbes = 0;
+    consecutiveShellReadProbes = 0;
   });
 
   pi.on("input", () => {
@@ -173,7 +196,8 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     lastErrorSignature = "";
     lastCallSignature = "";
     consecutiveSameCall = 0;
-    consecutiveInlineProbes = 0;
+    consecutivePythonProbes = 0;
+    consecutiveShellReadProbes = 0;
   });
 
   pi.on("tool_call", (event) => {
@@ -182,14 +206,6 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       return;
     }
     const input = event.input as Record<string, unknown> | undefined;
-    if (isHardBlockedHeredocCommand(toolName, input)) {
-      return {
-        block: true,
-        reason:
-          "Local tool guard: blocked large multi-line bash heredoc (>= 1000 chars). Use the write tool for new files or edit for updating existing files and notes.md instead of bash heredocs.",
-      };
-    }
-
     const sig = summarizeCallSignature(toolName, input);
     if (sig === lastCallSignature) {
       consecutiveSameCall += 1;
@@ -197,6 +213,22 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       lastCallSignature = sig;
       consecutiveSameCall = 1;
     }
+
+    if (isHardBlockedHeredocCommand(toolName, input)) {
+      if (consecutiveSameCall >= 2) {
+        return {
+          block: true,
+          reason:
+            "Loop guard + heredoc guard: you already tried this blocked heredoc. Stop calling bash for this write. Call edit(path, oldText, newText) to update an existing file or write(path, content) for a new file.",
+        };
+      }
+      return {
+        block: true,
+        reason:
+          "Local tool guard: blocked large multi-line bash heredoc (>= 1000 chars). Use write(path, content) for new files or edit(path, oldText, newText) to update existing files.",
+      };
+    }
+
     if (consecutiveSameCall >= 3) {
       return {
         block: true,
@@ -209,14 +241,20 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
   pi.on("tool_result", (event, ctx) => {
     const toolName = String(event.toolName || "");
     if (toolName === "phase_handoff") {
-      consecutiveInlineProbes = 0;
+      consecutivePythonProbes = 0;
+      consecutiveShellReadProbes = 0;
       return;
     }
 
-    if (isInlineProbeBash(toolName, event.input)) {
-      consecutiveInlineProbes += 1;
-    } else if (toolName === "write" || toolName === "edit" || toolName === "bash") {
-      consecutiveInlineProbes = 0;
+    if (isPythonInlineProbe(toolName, event.input)) {
+      consecutivePythonProbes += 1;
+      consecutiveShellReadProbes = 0;
+    } else if (isShellReadProbe(toolName, event.input)) {
+      consecutiveShellReadProbes += 1;
+      consecutivePythonProbes = 0;
+    } else if (toolName === "write" || toolName === "edit" || toolName === "read" || toolName === "bash") {
+      consecutivePythonProbes = 0;
+      consecutiveShellReadProbes = 0;
     }
 
     const hints: string[] = [];
@@ -226,9 +264,23 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       );
     }
 
-    if (INLINE_PROBE_STREAK_WARN > 0 && consecutiveInlineProbes >= INLINE_PROBE_STREAK_WARN && consecutiveInlineProbes % INLINE_PROBE_STREAK_WARN === 0) {
+    if (
+      INLINE_PROBE_STREAK_WARN > 0 &&
+      consecutivePythonProbes >= INLINE_PROBE_STREAK_WARN &&
+      consecutivePythonProbes % INLINE_PROBE_STREAK_WARN === 0
+    ) {
       hints.push(
-        `[Local efficiency hint: ${consecutiveInlineProbes} consecutive inline bash/python3 -c probes. Batch remaining checks into 1 short script or move straight to writing/updating deliverables with write/edit.]`,
+        `[Local efficiency hint: ${consecutivePythonProbes} consecutive inline python3 -c probes. Batch remaining checks into 1 short script or move straight to writing/updating deliverables with write/edit.]`,
+      );
+    }
+
+    if (
+      INLINE_PROBE_STREAK_WARN > 0 &&
+      consecutiveShellReadProbes >= INLINE_PROBE_STREAK_WARN &&
+      consecutiveShellReadProbes % INLINE_PROBE_STREAK_WARN === 0
+    ) {
+      hints.push(
+        `[Local efficiency hint: ${consecutiveShellReadProbes} consecutive bash cat/head/tail/sed reads. Prefer read(path, offset, limit) or edit(path, oldText, newText) instead of chaining shell reads.]`,
       );
     }
 
