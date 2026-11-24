@@ -168,10 +168,39 @@ export function isWorkspaceScratchScript(toolName: string, input: Record<string,
   return WORKSPACE_SCRATCH_RE.test(base) ? base : null;
 }
 
-function isTmpScratchPythonWrite(toolName: string, input: Record<string, unknown> | undefined): boolean {
+export function isTmpScratchScriptWrite(toolName: string, input: Record<string, unknown> | undefined): boolean {
   if (toolName !== "write" || !input) return false;
   const p = String(input.path ?? input.file_path ?? "");
-  return /^\/(?:private\/)?(?:var\/)?tmp\/.*\.py$/i.test(p);
+  return /^\/(?:private\/)?(?:var\/)?tmp\/.*\.(?:py|js|mjs|cjs)$/i.test(p);
+}
+
+/** Detect slow whole-filesystem find scans starting from root `/`. */
+export function isRootFilesystemFind(toolName: string, input: Record<string, unknown> | undefined): boolean {
+  if (toolName !== "bash" || !input) return false;
+  const cmd = typeof input.command === "string" ? input.command : "";
+  if (!cmd) return false;
+  if (/\s-maxdepth\s+[12]\b/.test(cmd)) return false;
+  return /(?:^|[;&|(\s])find\s+\/(?:\s|$)/.test(cmd);
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/** Convert mistaken `pi-verify-ui` direct tool calls into executable `bash` invocations. */
+export function repairMisnamedCliToolCall(item: { name?: string; arguments?: unknown }): boolean {
+  if (!item || (item.name !== "pi-verify-ui" && item.name !== "pi_verify_ui")) return false;
+  if (!item.arguments || typeof item.arguments !== "object" || Array.isArray(item.arguments)) return false;
+  const args = item.arguments as Record<string, unknown>;
+  const target = String(args.path ?? args.file ?? args.url ?? args.target ?? "").trim();
+  if (!target) return false;
+  const parts = ["pi-verify-ui", shellSingleQuote(target)];
+  if (args.dom === true || args.fast === true) parts.push("--dom");
+  const evalJs = String(args.evalJs ?? args.eval_js ?? "").trim();
+  if (evalJs) parts.push("--eval-js", shellSingleQuote(evalJs));
+  item.name = "bash";
+  item.arguments = { command: parts.join(" ") };
+  return true;
 }
 
 function isHeredocCommand(toolName: string, input: Record<string, unknown> | undefined): { isHeredoc: boolean; length: number } {
@@ -293,6 +322,7 @@ export function evaluateFileModifyChurn(
 /** Classify repeated turn-by-turn external CLI families that should be batched. */
 export function extractCliCommandFamily(cmd: string): string | null {
   if (!cmd) return null;
+  if (/\bpi-verify-ui\b/.test(cmd)) return "pi-verify-ui";
   if (/\bagent-browser\b/.test(cmd)) return "agent-browser";
   if (/\bbrowser-use\b/.test(cmd)) return "browser-use";
   if (/^\s*(?:[A-Z_][A-Z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+)*(?:curl|wget|http)\b/.test(cmd)) {
@@ -1371,6 +1401,11 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       }
       if (item.type !== "toolCall") continue;
       toolCallCount += 1;
+      if (repairMisnamedCliToolCall(item)) {
+        repaired = true;
+        appendLocalTrace("local-context-guard", "tool_repair", { tool: "bash", kind: "pi_verify_ui_alias" });
+        continue;
+      }
       if (!item.arguments || typeof item.arguments !== "object" || Array.isArray(item.arguments)) {
         continue;
       }
@@ -1455,11 +1490,20 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       consecutiveSameCall = 1;
     }
 
-    if (isTmpScratchPythonWrite(toolName, input)) {
+    if (isTmpScratchScriptWrite(toolName, input)) {
       return {
         block: true,
         reason:
-          "Local tool guard: do not write scratch Python scripts into /tmp. Write your real workspace deliverable (.py script in the current working directory) using write(path, content).",
+          "Local tool guard: do not write scratch scripts into /tmp. For HTML/UI verification, call bash with `pi-verify-ui --dom /ABS/PATH/file.html --eval-js \"...\"`; for code deliverables, write files in the current working directory.",
+      };
+    }
+
+    if (isRootFilesystemFind(toolName, input)) {
+      appendLocalTrace("local-context-guard", "root_find_blocked", {});
+      return {
+        block: true,
+        reason:
+          "Local tool guard: blocked slow root filesystem scan ('find / ...'). Use `command -v pi-verify-ui` (preinstalled in PATH at ~/.local/bin/pi-verify-ui) or restrict `find` to `.`.",
       };
     }
 
@@ -1789,7 +1833,11 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
             family: cliFamily,
             count: famCount,
           });
-          if (cliFamily === "agent-browser" || cliFamily === "browser-use") {
+          if (cliFamily === "pi-verify-ui") {
+            hints.push(
+              `[CLI batching hint: ${famCount} pi-verify-ui calls in this session. Batch all remaining UI assertions into 1 compound --eval-js IIFE (or a single .js file passed to --eval-js) and run 1 final real-Chrome check without --dom.]`,
+            );
+          } else if (cliFamily === "agent-browser" || cliFamily === "browser-use") {
             hints.push(
               `[CLI batching hint: ${famCount} ${cliFamily} calls in this session. Stop turn-by-turn browser CLI calls and use pi-verify-ui --dom /ABS/PATH/file.html --eval-js ... (fast virtual DOM) or pi-verify-ui /ABS/PATH/file.html --eval-js ... (single-shot real headless Chrome).]`,
             );

@@ -14,11 +14,14 @@ import {
   extractCliCommandFamily,
   findClosestEditLineHint,
   inspectJsonClusterSkew,
+  isRootFilesystemFind,
+  isTmpScratchScriptWrite,
   isWorkspaceScratchScript,
   lintFileIssues,
   normalizeErrorClass,
   repairEditArguments,
   repairMacOsTimeoutCommand,
+  repairMisnamedCliToolCall,
 } from "../extensions/local-context-guard.ts";
 import { evaluateVerifySpec } from "../extensions/local-goal-gate.ts";
 import { parseCriticVerdict, collectCriticBundle, shouldSkipAutoCriticForProvider } from "../extensions/local-critic.ts";
@@ -575,6 +578,52 @@ test("general harness guardrails: churn breaker, CLI family detector, error clas
   assert.deepEqual(resolveAdaptiveSplashThinkingBudget("medium", 3), { budget: 1536, escalated: true, steps: 1 });
   assert.deepEqual(resolveAdaptiveSplashThinkingBudget("high", 3), { budget: 2560, escalated: true, steps: 1 });
   assert.deepEqual(resolveAdaptiveSplashThinkingBudget("off", 5), { budget: undefined, escalated: false, steps: 0 });
+});
+
+test("empirical microtest fixes: happy-dom textContent=0, auto-invoke eval function, root find block, /tmp js/py block, pi-verify-ui repair & family", () => {
+  assert.equal(extractCliCommandFamily("pi-verify-ui --dom /tmp/app.html"), "pi-verify-ui");
+
+  assert.equal(isTmpScratchScriptWrite("write", { path: "/tmp/test_triage.mjs" }), true);
+  assert.equal(isTmpScratchScriptWrite("write", { path: "/private/tmp/_probe.py" }), true);
+  assert.equal(isTmpScratchScriptWrite("write", { path: "app.js" }), false);
+
+  assert.equal(isRootFilesystemFind("bash", { command: 'which pi-verify-ui; find / -name "pi-verify-ui*"' }), true);
+  assert.equal(isRootFilesystemFind("bash", { command: "find . -name '*.py'" }), false);
+  assert.equal(isRootFilesystemFind("bash", { command: "find /tmp -maxdepth 1 -type f" }), false);
+
+  const misnamed = { name: "pi-verify-ui", arguments: { path: "/abs/app.html", dom: true, evalJs: "(() => ({ok:true}))()" } };
+  assert.equal(repairMisnamedCliToolCall(misnamed), true);
+  assert.equal(misnamed.name, "bash");
+  assert.match(misnamed.arguments.command, /^pi-verify-ui '\/abs\/app\.html' --dom --eval-js /);
+
+  withTempDir((dir) => {
+    const html = path.join(dir, "zero_badge.html");
+    fs.writeFileSync(
+      html,
+      [
+        "<!doctype html><html><head><title>Zero TextContent</title></head><body>",
+        "<h1>Triage Queue</h1>",
+        "<p>Testing zero numeric textContent assignment in happy-dom.</p>",
+        '<span id="badge">init</span>',
+        "<script>document.getElementById('badge').textContent = 0;</script>",
+        "</body></html>",
+      ].join("\n"),
+      "utf-8",
+    );
+    const raw = execFileSync(
+      path.join(REPO_DIR, "bin/pi-verify-ui"),
+      [
+        html,
+        "--dom",
+        "--eval-js",
+        "function() { return { ok: document.getElementById('badge').textContent === '0', val: document.getElementById('badge').textContent }; }",
+      ],
+      { encoding: "utf-8" },
+    );
+    const parsed = JSON.parse(raw.trim().split("\n").pop());
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.custom?.val, "0");
+  });
 });
 
 test("parseCriticVerdict filters inline/embedded JSON false positives while preserving real defects", () => {

@@ -211,6 +211,9 @@ function buildDomInspectionScript(minText, customExpr) {
     }
   }
   let custom = await Promise.resolve(${customExpr});
+  if (typeof custom === "function") {
+    custom = await Promise.resolve(custom());
+  }
   return {
     title: doc.title || "",
     url: location.href,
@@ -246,6 +249,19 @@ async function runDomMode(resolved, opts, customExpr) {
   });
 
   try {
+    for (const proto of [win.Element?.prototype, win.Node?.prototype]) {
+      const tcDesc = proto ? Object.getOwnPropertyDescriptor(proto, "textContent") : null;
+      if (tcDesc && tcDesc.configurable && typeof tcDesc.set === "function") {
+        Object.defineProperty(proto, "textContent", {
+          configurable: true,
+          enumerable: Boolean(tcDesc.enumerable),
+          get: tcDesc.get,
+          set(val) {
+            tcDesc.set.call(this, val === null || val === undefined ? "" : String(val));
+          },
+        });
+      }
+    }
     const origError = win.console.error.bind(win.console);
     win.console.error = (...args) => {
       consoleErrors.push(args.map((a) => (a && a.message ? a.message : String(a))).join(" "));
@@ -292,7 +308,11 @@ async function runDomMode(resolved, opts, customExpr) {
     let custom = null;
     if (opts.evalJs) {
       try {
-        custom = await Promise.resolve(win.eval(`(${customExpr})`));
+        let evalVal = win.eval(`(${customExpr})`);
+        if (typeof evalVal === "function") {
+          evalVal = evalVal();
+        }
+        custom = await Promise.resolve(evalVal);
       } catch (err) {
         pageErrors.push(String(err?.message || err));
       }
