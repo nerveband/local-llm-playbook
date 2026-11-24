@@ -139,6 +139,29 @@ export function resolveSplashThinkingBudget(level: string | undefined): number |
   }
 }
 
+const SPLASH_ADAPTIVE_LADDER: Record<number, readonly [number, number, number]> = {
+  384: [384, 640, 1024],
+  640: [640, 1024, 1536],
+  1152: [1152, 1536, 2048],
+  2048: [2048, 2560, 3072],
+  3072: [3072, 3072, 3072],
+};
+
+/** Escalate Splash thinking budget one tier per 3 consecutive cap hits, resetting when clean. */
+export function resolveAdaptiveSplashThinkingBudget(
+  level: string | undefined,
+  consecutiveCapHits: number,
+): { budget: number | undefined; escalated: boolean; steps: number } {
+  const base = resolveSplashThinkingBudget(level);
+  if (base === undefined) {
+    return { budget: undefined, escalated: false, steps: 0 };
+  }
+  const steps = consecutiveCapHits >= 3 ? Math.min(2, Math.floor(consecutiveCapHits / 3)) : 0;
+  const ladder = SPLASH_ADAPTIVE_LADDER[base] ?? [base, base, base];
+  const nextBudget = ladder[steps] ?? base;
+  return { budget: nextBudget, escalated: nextBudget > base, steps };
+}
+
 export function resolveServerOrigin(model: ExtensionContext["model"]): string | null {
   const baseUrl = String((model as { baseUrl?: string } | undefined)?.baseUrl || "");
   if (baseUrl) {
@@ -255,6 +278,8 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
   let lastCtx: ExtensionContext | null = null;
   let ticker: ReturnType<typeof setInterval> | null = null;
   let statusEndpointUnsupported = false;
+  let consecutiveThinkingCapHits = 0;
+  let lastSentThinkingBudget: number | null = null;
 
   function safeSetStatus(ctx: ExtensionContext | null, text: string | undefined): void {
     if (disposed || !ctx) return;
@@ -447,6 +472,8 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
     lastCompletedSummary = null;
     latestStatusSnapshot = null;
     statusEndpointUnsupported = false;
+    consecutiveThinkingCapHits = 0;
+    lastSentThinkingBudget = null;
     safeSetStatus(ctx, "⚡ --");
   });
 
@@ -454,6 +481,8 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
     lastCtx = ctx;
     latestStatusSnapshot = null;
     statusEndpointUnsupported = false;
+    consecutiveThinkingCapHits = 0;
+    lastSentThinkingBudget = null;
   });
 
   pi.on("before_provider_request", (event, ctx) => {
@@ -530,11 +559,23 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
           const effectiveLevel = adaptiveEnabled
             ? resolveEscalatedThinkingLevel(baseLevel, Number(g.__piLocalEscalation?.offset || 0))
             : baseLevel;
-          const budget = resolveSplashThinkingBudget(effectiveLevel);
-          if (budget !== undefined) {
-            nextPayload.thinking_token_budget = budget;
+          const adaptive = resolveAdaptiveSplashThinkingBudget(effectiveLevel, consecutiveThinkingCapHits);
+          if (adaptive.budget !== undefined) {
+            nextPayload.thinking_token_budget = adaptive.budget;
+            lastSentThinkingBudget = adaptive.budget;
             changed = true;
+            if (adaptive.escalated) {
+              appendLocalTrace("local-omlx-meter", "thinking_budget_escalated", {
+                provider,
+                effectiveLevel,
+                budget: adaptive.budget,
+                consecutiveCapHits: consecutiveThinkingCapHits,
+                steps: adaptive.steps,
+              });
+            }
           }
+        } else if (typeof nextPayload.thinking_token_budget === "number") {
+          lastSentThinkingBudget = nextPayload.thinking_token_budget;
         }
       }
     }
@@ -686,6 +727,19 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
     );
     safeSetStatus(ctx, lastCompletedSummary);
 
+    const providerLower = String(ctx.model?.provider || "").toLowerCase();
+    if (
+      isSplashProvider(providerLower) &&
+      lastSentThinkingBudget !== null &&
+      typeof serverStats?.reasoningTokens === "number"
+    ) {
+      if (serverStats.reasoningTokens >= lastSentThinkingBudget - 16) {
+        consecutiveThinkingCapHits += 1;
+      } else {
+        consecutiveThinkingCapHits = 0;
+      }
+    }
+
     appendLocalTrace("local-omlx-meter", "turn_end", {
       provider: ctx.model?.provider,
       model: ctx.model?.id,
@@ -697,6 +751,8 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
       cachedTokens: serverStats?.cachedTokens ?? null,
       outputTokens: outTok,
       reasoningTokens: serverStats?.reasoningTokens ?? null,
+      thinkingBudget: lastSentThinkingBudget,
+      thinkingCapStreak: consecutiveThinkingCapHits,
     });
 
     const completedTurnStamp = now;

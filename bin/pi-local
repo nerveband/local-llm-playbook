@@ -730,6 +730,7 @@ fi
 if [[ "$TRACE_ENABLED" == "1" ]]; then
   export PI_LOCAL_TRACE=1
 fi
+export NODE_PATH="$LOCAL_EXT_ROOT${NODE_PATH:+:$NODE_PATH}"
 
 if [[ "$PRINT_CMD" == "1" ]]; then
   print -r -- "pi ${(q-)ARGS[@]} ${(q-)@}"

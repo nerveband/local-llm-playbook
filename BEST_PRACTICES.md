@@ -144,7 +144,7 @@ To eliminate those multi-turn retry loops automatically without mutating prior K
 3. **Static & runtime anti-pattern guards (`local-context-guard.ts` + `pi-preflight`):**
    - `pi-preflight` profiles workspace CSVs with zero row leakage and annotates low-cardinality columns (`distinct<=20` on `>= 100` rows) upfront so union-find logic never groups on statuses, types, or dates.
    - `checkPythonPerfHazards` inspects newly written or edited `.py` scripts immediately for unguarded `O(K^2)` `range(len(x))` pair loops before execution, while `inspectJsonClusterSkew` flags newly generated `.json` cluster outputs whose largest bucket exceeds `100` items (or `>= 50` on slow runs).
-   - Paired with `pi-verify-ui` (single-shot headless Chromium audit) and `local-goal-gate.ts` (`.pi-verify.json`), silent UI/clustering bugs fail cleanly in seconds instead of stalling multi-minute local turns.
+   - Paired with `pi-verify-ui --dom` (sub-`200 ms` in-process Node `happy-dom` inner loop with preinstalled `NODE_PATH`) + `pi-verify-ui` (single-shot real headless Chrome CDP final layout/error audit) and `local-goal-gate.ts` (`.pi-verify.json`), silent UI/clustering bugs fail cleanly in seconds without leaking `agent-browser` daemons or multi-turn browser polling. General filename-agnostic guardrails (`evaluateFileModifyChurn`, `extractCliCommandFamily`, `normalizeErrorClass`, and `resolveAdaptiveSplashThinkingBudget`) also catch per-file edit churn, repeated CLI probing, recurring non-consecutive error classes, and Splash thinking-cap starvation.
 
 ---
 

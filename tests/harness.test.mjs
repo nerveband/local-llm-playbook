@@ -9,11 +9,14 @@ import {
   checkSyntaxForFile,
   detectHardcodedSecrets,
   detectPrematureStop,
+  evaluateFileModifyChurn,
   extractAgentBrowserSessions,
+  extractCliCommandFamily,
   findClosestEditLineHint,
   inspectJsonClusterSkew,
   isWorkspaceScratchScript,
   lintFileIssues,
+  normalizeErrorClass,
   repairEditArguments,
   repairMacOsTimeoutCommand,
 } from "../extensions/local-context-guard.ts";
@@ -21,6 +24,7 @@ import { evaluateVerifySpec } from "../extensions/local-goal-gate.ts";
 import { parseCriticVerdict, collectCriticBundle, shouldSkipAutoCriticForProvider } from "../extensions/local-critic.ts";
 import {
   isSplashProvider,
+  resolveAdaptiveSplashThinkingBudget,
   resolveEscalatedThinkingLevel,
   resolveInklingReasoningEffort,
   resolveServerOrigin,
@@ -433,9 +437,144 @@ test("isWorkspaceScratchScript and pi-verify-ui zeroSizeSelectors + file input e
     const raw = execFileSync(path.join(REPO_DIR, "bin/pi-verify-ui"), [html], { encoding: "utf-8" });
     const parsed = JSON.parse(raw.trim().split("\n").pop());
     assert.equal(parsed.ok, true);
+    assert.equal(parsed.mode, "chrome-cdp");
+    assert.equal(parsed.layoutChecked, true);
     assert.equal(parsed.zeroSizeInteractive, 1);
     assert.deepEqual(parsed.zeroSizeSelectors, ["button#zeroBtn.tiny-btn"]);
   });
+});
+
+test("pi-verify-ui --dom (happy-dom) executes local script src, eval-js, and captures errors fast", () => {
+  withTempDir((dir) => {
+    fs.writeFileSync(
+      path.join(dir, "app.js"),
+      [
+        "window.__count = 0;",
+        "document.getElementById('incBtn').addEventListener('click', () => {",
+        "  window.__count += 1;",
+        "  document.getElementById('out').textContent = 'Clicks: ' + window.__count;",
+        "});",
+      ].join("\n"),
+      "utf-8",
+    );
+    const html = path.join(dir, "dom_ok.html");
+    fs.writeFileSync(
+      html,
+      [
+        "<!doctype html><html><head><title>DOM Mode</title></head><body>",
+        "<h1>Interactive Queue</h1>",
+        "<p id='out'>Loaded virtual DOM review fixture cleanly.</p>",
+        "<button id='incBtn'>Increment</button>",
+        '<script src="app.js"></script>',
+        "</body></html>",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    const t0 = performance.now();
+    const rawOk = execFileSync(
+      path.join(REPO_DIR, "bin/pi-verify-ui"),
+      [
+        html,
+        "--dom",
+        "--eval-js",
+        "(() => { document.getElementById('incBtn').click(); return { ok: document.getElementById('out').textContent === 'Clicks: 1', txt: document.getElementById('out').textContent }; })()",
+      ],
+      { encoding: "utf-8" },
+    );
+    const elapsedMs = performance.now() - t0;
+    const resOk = JSON.parse(rawOk.trim().split("\n").pop());
+    assert.equal(resOk.ok, true);
+    assert.equal(resOk.mode, "happy-dom");
+    assert.equal(resOk.layoutChecked, false);
+    assert.equal(resOk.custom?.txt, "Clicks: 1");
+    assert.ok(elapsedMs < 2500, `pi-verify-ui --dom took ${elapsedMs}ms`);
+
+    const badHtml = path.join(dir, "dom_bad.html");
+    fs.writeFileSync(
+      badHtml,
+      "<!doctype html><html><head><title>Bad DOM</title></head><body><h1>Broken DOM Fixture</h1><p>This body has enough characters to pass text length checks.</p><script>console.error('ui_fail'); missingDomFn();</script></body></html>",
+      "utf-8",
+    );
+    let failOut = "";
+    try {
+      execFileSync(path.join(REPO_DIR, "bin/pi-verify-ui"), [badHtml, "--dom"], { encoding: "utf-8" });
+      assert.fail("Expected pi-verify-ui --dom to fail on console.error + ReferenceError");
+    } catch (err) {
+      failOut = String(err.stdout || "");
+    }
+    const resBad = JSON.parse(failOut.trim().split("\n").pop());
+    assert.equal(resBad.ok, false);
+    assert.ok(resBad.consoleErrorCount >= 1);
+    assert.ok(resBad.pageErrorCount >= 1);
+  });
+});
+
+test("pi-verify-ui Chrome CDP supports screenshot and eval-js with zero orphan processes", () => {
+  withTempDir((dir) => {
+    const html = path.join(dir, "cdp.html");
+    const shot = path.join(dir, "shot.png");
+    fs.writeFileSync(
+      html,
+      [
+        "<!doctype html><html><head><title>CDP Mode</title></head><body>",
+        "<h1>CDP Verification</h1>",
+        "<p id='status'>Ready for headless Chromium evaluation and screenshot capture.</p>",
+        "<button id='btn' onclick=\"document.getElementById('status').textContent='Done'\">Run</button>",
+        "</body></html>",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    const raw = execFileSync(
+      path.join(REPO_DIR, "bin/pi-verify-ui"),
+      [
+        html,
+        "--eval-js",
+        "(() => { document.getElementById('btn').click(); return { ok: document.getElementById('status').textContent === 'Done' }; })()",
+        "--screenshot",
+        shot,
+      ],
+      { encoding: "utf-8" },
+    );
+    const parsed = JSON.parse(raw.trim().split("\n").pop());
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.mode, "chrome-cdp");
+    assert.equal(parsed.layoutChecked, true);
+    assert.equal(parsed.custom?.ok, true);
+    assert.ok(fs.existsSync(shot) && fs.statSync(shot).size > 100);
+  });
+});
+
+test("general harness guardrails: churn breaker, CLI family detector, error class normalizer, and adaptive Splash thinking cap", () => {
+  const churnMap = new Map();
+  for (let i = 1; i <= 7; i += 1) {
+    assert.equal(evaluateFileModifyChurn(churnMap, "./app.py")?.shouldNudge, false);
+  }
+  assert.equal(evaluateFileModifyChurn(churnMap, "app.py")?.shouldNudge, true);
+  assert.equal(evaluateFileModifyChurn(churnMap, "app.py")?.shouldNudge, false);
+  for (let i = 10; i <= 11; i += 1) {
+    assert.equal(evaluateFileModifyChurn(churnMap, "app.py")?.shouldNudge, false);
+  }
+  assert.equal(evaluateFileModifyChurn(churnMap, "app.py")?.shouldNudge, true);
+
+  assert.equal(extractCliCommandFamily('AGENT_BROWSER_SESSION="ui" agent-browser eval "1+1"'), "agent-browser");
+  assert.equal(extractCliCommandFamily("browser-use open http://localhost"), "browser-use");
+  assert.equal(extractCliCommandFamily("TOKEN=x curl -s http://127.0.0.1:8080/health"), "http-cli");
+  assert.equal(extractCliCommandFamily("python3 build_report.py"), null);
+
+  const err1 = normalizeErrorClass("edit", "Line 14#AB [E_NO_MATCH] Could not find \"foo_bar\" at line 14");
+  const err2 = normalizeErrorClass("edit", "Line 99#ZZ [E_NO_MATCH] Could not find \"baz_qux\" at line 99");
+  assert.equal(err1, err2);
+  assert.ok(err1 && err1.startsWith("edit:"));
+
+  assert.deepEqual(resolveAdaptiveSplashThinkingBudget("low", 0), { budget: 640, escalated: false, steps: 0 });
+  assert.deepEqual(resolveAdaptiveSplashThinkingBudget("low", 2), { budget: 640, escalated: false, steps: 0 });
+  assert.deepEqual(resolveAdaptiveSplashThinkingBudget("low", 3), { budget: 1024, escalated: true, steps: 1 });
+  assert.deepEqual(resolveAdaptiveSplashThinkingBudget("low", 6), { budget: 1536, escalated: true, steps: 2 });
+  assert.deepEqual(resolveAdaptiveSplashThinkingBudget("medium", 3), { budget: 1536, escalated: true, steps: 1 });
+  assert.deepEqual(resolveAdaptiveSplashThinkingBudget("high", 3), { budget: 2560, escalated: true, steps: 1 });
+  assert.deepEqual(resolveAdaptiveSplashThinkingBudget("off", 5), { budget: undefined, escalated: false, steps: 0 });
 });
 
 test("parseCriticVerdict filters inline/embedded JSON false positives while preserving real defects", () => {

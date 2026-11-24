@@ -1,214 +1,637 @@
-#!/bin/zsh
-set -euo pipefail
+#!/usr/bin/env node
+"use strict";
 
-usage() {
-  cat <<'EOF'
-Usage: pi-verify-ui <html-file-or-url> [options]
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 
-Single-shot headless Chromium DOM, console/pageerror, layout, and optional custom JS audit
-using agent-browser with guaranteed session cleanup.
-
-Options:
-  --eval-js <file>       JS expression or file whose expression returns {ok, detail} or truthy
-  --expect-min-text <n>  Minimum visible body innerText length (default: 40)
-  --screenshot <path>    Save screenshot to <path>
-  --session <name>       Override AGENT_BROWSER_SESSION name
-  -h, --help             Show help
-EOF
+function printHelp() {
+  process.stdout.write(
+    [
+      "Usage: pi-verify-ui <html-file-or-url> [options]",
+      "",
+      "Single-shot UI verification using either real headless Chrome CDP (default)",
+      "or fast in-process Node happy-dom (--dom / --fast) with zero external daemons.",
+      "",
+      "Options:",
+      "  --dom, --fast          Run fast virtual DOM verification in Node happy-dom (<200ms)",
+      "  --eval-js <expr|file>  JS expression or file whose result/ok field is checked",
+      "  --expect-min-text <n>  Minimum visible body innerText length (default: 40)",
+      "  --screenshot <path>    Save PNG screenshot to <path> (Chrome CDP mode)",
+      "  --timeout <ms>         Timeout in milliseconds (default: 15000)",
+      "  --session <name>       Accepted for CLI compatibility (no-op)",
+      "  -h, --help             Show help",
+      "",
+    ].join("\n"),
+  );
 }
 
-if [[ $# -eq 0 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  usage
-  exit 0
-fi
-
-TARGET="$1"
-shift
-EVAL_JS=""
-MIN_TEXT=40
-SCREENSHOT=""
-SESSION="pi-ui-$$-$RANDOM"
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --eval-js) EVAL_JS="${2:-}"; shift 2 ;;
-    --expect-min-text) MIN_TEXT="${2:-40}"; shift 2 ;;
-    --screenshot) SCREENSHOT="${2:-}"; shift 2 ;;
-    --session) SESSION="${2:-$SESSION}"; shift 2 ;;
-    -h|--help) usage; exit 0 ;;
-    *) print -u2 "Unknown option: $1"; exit 2 ;;
-  esac
-done
-
-URL="$TARGET"
-if [[ "$TARGET" != http://* && "$TARGET" != https://* && "$TARGET" != file://* ]]; then
-  ABS_PATH=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$TARGET")
-  if [[ ! -e "$ABS_PATH" ]]; then
-    print -r -- "{\"ok\":false,\"error\":\"Target file not found: $ABS_PATH\"}"
-    exit 1
-  fi
-  URL="file://$ABS_PATH"
-fi
-
-if ! command -v agent-browser >/dev/null 2>&1; then
-  print -r -- '{"ok":false,"error":"agent-browser binary not found in PATH"}'
-  exit 1
-fi
-
-export AGENT_BROWSER_SESSION="$SESSION"
-AB_BEFORE=" $( (pgrep -f 'agent-browser-darwin-arm64' 2>/dev/null || true) | tr '\n' ' ') "
-cleanup() {
-  agent-browser close >/dev/null 2>&1 || true
-  pkill -TERM -f -- "AGENT_BROWSER_SESSION=$SESSION" >/dev/null 2>&1 || true
-  if [[ "${PI_VERIFY_UI_SWEEP:-0}" == "1" ]]; then
-    pkill -TERM -f -- "agent-browser-darwin-arm64" >/dev/null 2>&1 || true
-    pkill -TERM -f -- "agent-browser-chrome-" >/dev/null 2>&1 || true
-    sleep 0.2
-    pkill -KILL -f -- "agent-browser-darwin-arm64" >/dev/null 2>&1 || true
-    pkill -KILL -f -- "agent-browser-chrome-" >/dev/null 2>&1 || true
-  else
-    typeset -a new_pids=()
-    for ab_pid in ${(f)"$(pgrep -f 'agent-browser-darwin-arm64' 2>/dev/null || true)"}; do
-      if [[ -n "$ab_pid" && "$AB_BEFORE" != *" $ab_pid "* ]]; then
-        kill -TERM "$ab_pid" >/dev/null 2>&1 || true
-        new_pids+=("$ab_pid")
-      fi
-    done
-    if [[ ${#new_pids[@]} -gt 0 ]]; then
-      sleep 0.2
-      for ab_pid in "${new_pids[@]}"; do
-        if kill -0 "$ab_pid" >/dev/null 2>&1; then
-          kill -KILL "$ab_pid" >/dev/null 2>&1 || true
-        fi
-      done
-    fi
-  fi
+function parseArgs(argv) {
+  const opts = {
+    target: "",
+    dom: false,
+    evalJs: "",
+    minText: 40,
+    screenshot: "",
+    timeoutMs: Number(process.env.PI_VERIFY_UI_TIMEOUT_MS || 15000),
+  };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "-h" || arg === "--help") {
+      return { help: true, opts };
+    }
+    if (arg === "--dom" || arg === "--fast") {
+      opts.dom = true;
+      continue;
+    }
+    if (arg === "--eval-js") {
+      opts.evalJs = argv[++i] || "";
+      continue;
+    }
+    if (arg === "--expect-min-text") {
+      opts.minText = Number.parseInt(argv[++i] || "40", 10);
+      if (!Number.isFinite(opts.minText) || opts.minText < 0) opts.minText = 40;
+      continue;
+    }
+    if (arg === "--screenshot") {
+      opts.screenshot = argv[++i] || "";
+      continue;
+    }
+    if (arg === "--timeout") {
+      const parsed = Number.parseInt(argv[++i] || "15000", 10);
+      if (Number.isFinite(parsed) && parsed > 0) opts.timeoutMs = parsed;
+      continue;
+    }
+    if (arg === "--session") {
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("-")) {
+      throw new Error(`Unknown option: ${arg}`);
+    }
+    if (!opts.target) {
+      opts.target = arg;
+    } else {
+      throw new Error(`Unexpected extra argument: ${arg}`);
+    }
+  }
+  return { help: false, opts };
 }
-trap cleanup EXIT INT TERM
 
-CUSTOM_EXPR="null"
-if [[ -n "$EVAL_JS" ]]; then
-  if [[ -f "$EVAL_JS" ]]; then
-    CUSTOM_EXPR=$(cat "$EVAL_JS")
-  else
-    CUSTOM_EXPR="$EVAL_JS"
-  fi
-fi
+function resolveTarget(target) {
+  if (/^https?:\/\//i.test(target)) {
+    return { isHttp: true, absPath: "", url: target };
+  }
+  let fileCandidate = target;
+  if (/^file:\/\//i.test(target)) {
+    fileCandidate = new URL(target).pathname;
+  }
+  const absPath = path.resolve(fileCandidate);
+  if (!fs.existsSync(absPath)) {
+    throw new Error(`Target file not found: ${absPath}`);
+  }
+  return { isHttp: false, absPath, url: pathToFileURL(absPath).href };
+}
 
-agent-browser open "$URL" >/dev/null
-agent-browser wait --load networkidle >/dev/null 2>&1 || sleep 0.5
+function readCustomExpr(evalJsArg) {
+  if (!evalJsArg) return "null";
+  try {
+    if (fs.existsSync(evalJsArg) && fs.statSync(evalJsArg).isFile()) {
+      return fs.readFileSync(evalJsArg, "utf-8");
+    }
+  } catch {
+    // Treat as raw JS expression if stat fails.
+  }
+  return evalJsArg;
+}
 
-CONSOLE_RAW=$(agent-browser console --json 2>/dev/null || print -r -- "[]")
-ERRORS_RAW=$(agent-browser errors --json 2>/dev/null || print -r -- "[]")
+function loadHappyDom() {
+  try {
+    return require("happy-dom");
+  } catch {
+    const fallback = path.join(os.homedir(), ".local/share/pi-local-extensions/node_modules/happy-dom");
+    return require(fallback);
+  }
+}
 
-DOM_JS=$(python3 - "$MIN_TEXT" "$CUSTOM_EXPR" <<'PY'
-import json, sys
-min_text = int(sys.argv[1])
-custom_expr = sys.argv[2]
-print(f"""(() => {{
-  const textLen = (document.body?.innerText || "").trim().length;
-  const tables = document.querySelectorAll("table").length;
-  const rows = document.querySelectorAll("tr").length;
-  const buttons = document.querySelectorAll("button").length;
-  const inputs = document.querySelectorAll("input,select,textarea").length;
-  const headings = document.querySelectorAll("h1,h2,h3").length;
+function inlineLocalScriptsForDom(html, htmlDir) {
+  return html.replace(
+    /<script\b([^>]*?)\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))([^>]*)>\s*<\/script>/gi,
+    (fullMatch, before, dqSrc, sqSrc, uqSrc, after) => {
+      const src = (dqSrc || sqSrc || uqSrc || "").trim();
+      if (!src || /^(?:https?:|data:|blob:|\/\/)/i.test(src)) {
+        return fullMatch;
+      }
+      if (/\btype\s*=\s*["']module["']/i.test(`${before} ${after}`)) {
+        return fullMatch;
+      }
+      const cleanRel = src.split("?")[0].split("#")[0];
+      const absJs = path.resolve(htmlDir, cleanRel);
+      if (!fs.existsSync(absJs) || !fs.statSync(absJs).isFile()) {
+        return fullMatch;
+      }
+      const jsContent = fs.readFileSync(absJs, "utf-8").replace(/<\/script/gi, "<\\/script");
+      return `<script data-inlined-src="${cleanRel}">\n${jsContent}\n</script>`;
+    },
+  );
+}
+
+function buildResult({
+  mode,
+  layoutChecked,
+  dom,
+  minText,
+  consoleErrors,
+  pageErrors,
+  screenshot,
+}) {
+  const custom = dom.custom !== undefined ? dom.custom : null;
+  let customOk = true;
+  if (custom === false || (custom && typeof custom === "object" && custom.ok === false)) {
+    customOk = false;
+  }
+  const ok =
+    Boolean(dom.minTextPass) &&
+    consoleErrors.length === 0 &&
+    pageErrors.length === 0 &&
+    customOk;
+
+  const out = {
+    ok,
+    mode,
+    layoutChecked,
+    title: dom.title || "",
+    bodyTextLen: Number(dom.bodyTextLen || 0),
+    minTextRequired: minText,
+    counts: dom.counts || { tables: 0, rows: 0, buttons: 0, inputs: 0, headings: 0 },
+    zeroSizeInteractive: Number(dom.zeroSizeInteractive || 0),
+    zeroSizeSelectors: Array.isArray(dom.zeroSizeSelectors) ? dom.zeroSizeSelectors : [],
+    consoleErrorCount: consoleErrors.length,
+    pageErrorCount: pageErrors.length,
+    consoleErrors: consoleErrors.slice(0, 5).map((e) => String(e).slice(0, 160)),
+    pageErrors: pageErrors.slice(0, 5).map((e) => String(e).slice(0, 160)),
+    custom,
+  };
+  if (screenshot) {
+    out.screenshot = screenshot;
+  }
+  return out;
+}
+
+function buildDomInspectionScript(minText, customExpr) {
+  return `(async () => {
+  const doc = document;
+  const textLen = (doc.body?.innerText || doc.body?.textContent || "").trim().length;
+  const tables = doc.querySelectorAll("table").length;
+  const rows = doc.querySelectorAll("tr").length;
+  const buttons = doc.querySelectorAll("button").length;
+  const inputs = doc.querySelectorAll("input,select,textarea").length;
+  const headings = doc.querySelectorAll("h1,h2,h3").length;
   let zeroSizeInteractive = 0;
   const zeroSizeSelectors = [];
-  for (const el of document.querySelectorAll("button,input,select")) {{
-    if (el.tagName === "INPUT") {{
+  for (const el of doc.querySelectorAll("button,input,select")) {
+    if (el.tagName === "INPUT") {
       const t = (el.getAttribute("type") || "").toLowerCase();
       if (t === "hidden" || t === "file") continue;
-    }}
+    }
     const st = getComputedStyle(el);
     if (st.display === "none" || st.visibility === "hidden") continue;
     const r = el.getBoundingClientRect();
-    if (r.width === 0 || r.height === 0) {{
+    if (r.width === 0 || r.height === 0) {
       zeroSizeInteractive++;
-      if (zeroSizeSelectors.length < 5) {{
+      if (zeroSizeSelectors.length < 5) {
         const idPart = el.id ? "#" + el.id : "";
         const clsPart = typeof el.className === "string" && el.className.trim()
           ? "." + el.className.trim().split(/\\s+/).slice(0, 2).join(".")
           : "";
         zeroSizeSelectors.push(el.tagName.toLowerCase() + idPart + clsPart);
-      }}
-    }}
-  }}
-  let custom = {custom_expr};
-  return {{
-    title: document.title || "",
+      }
+    }
+  }
+  let custom = await Promise.resolve(${customExpr});
+  return {
+    title: doc.title || "",
     url: location.href,
     bodyTextLen: textLen,
-    minTextPass: textLen >= {min_text},
-    counts: {{ tables, rows, buttons, inputs, headings }},
+    minTextPass: textLen >= ${minText},
+    counts: { tables, rows, buttons, inputs, headings },
     zeroSizeInteractive,
     zeroSizeSelectors,
     custom
-  }};
-}})()""")
-PY
-)
-
-DOM_RAW=$(agent-browser eval --json "$DOM_JS" 2>/dev/null || print -r -- '{"success":false}')
-
-if [[ -n "$SCREENSHOT" ]]; then
-  agent-browser screenshot "$SCREENSHOT" >/dev/null 2>&1 || true
-fi
-
-python3 - "$CONSOLE_RAW" "$ERRORS_RAW" "$DOM_RAW" "$MIN_TEXT" "$SCREENSHOT" <<'PY'
-import json, sys
-
-def parse(raw):
-    try:
-        return json.loads(raw)
-    except Exception:
-        return raw
-
-con_data = parse(sys.argv[1])
-err_data = parse(sys.argv[2])
-dom_wrap = parse(sys.argv[3])
-min_text = int(sys.argv[4])
-shot = sys.argv[5]
-
-con_items = con_data.get("data", {}).get("messages", []) if isinstance(con_data, dict) else []
-console_errors = [m for m in con_items if isinstance(m, dict) and str(m.get("type", "")).lower() in ("error", "assert")]
-
-err_items = []
-if isinstance(err_data, dict):
-    d = err_data.get("data", {})
-    err_items = d.get("errors", []) if isinstance(d, dict) else []
-
-dom = dom_wrap.get("data", {}).get("result", dom_wrap) if isinstance(dom_wrap, dict) else {}
-if not isinstance(dom, dict):
-    dom = {}
-
-custom = dom.get("custom")
-custom_ok = True
-if custom is False or (isinstance(custom, dict) and custom.get("ok") is False):
-    custom_ok = False
-
-ok = (
-    bool(dom.get("minTextPass"))
-    and len(console_errors) == 0
-    and len(err_items) == 0
-    and custom_ok
-)
-
-out = {
-    "ok": ok,
-    "title": dom.get("title", ""),
-    "bodyTextLen": dom.get("bodyTextLen", 0),
-    "minTextRequired": min_text,
-    "counts": dom.get("counts", {}),
-    "zeroSizeInteractive": dom.get("zeroSizeInteractive", 0),
-    "zeroSizeSelectors": dom.get("zeroSizeSelectors", []),
-    "consoleErrorCount": len(console_errors),
-    "pageErrorCount": len(err_items),
-    "consoleErrors": [m.get("text", str(m))[:160] for m in console_errors[:5]],
-    "pageErrors": [str(e)[:160] for e in err_items[:5]],
-    "custom": custom,
+  };
+})()`;
 }
-if shot:
-    out["screenshot"] = shot
-print(json.dumps(out))
-sys.exit(0 if ok else 1)
-PY
+
+async function runDomMode(resolved, opts, customExpr) {
+  if (resolved.isHttp) {
+    throw new Error("--dom mode requires a local HTML file path; omit --dom to audit http(s) URLs in Chrome");
+  }
+  const { Window } = loadHappyDom();
+  const consoleErrors = [];
+  const pageErrors = [];
+  const win = new Window({
+    url: resolved.url,
+    width: 1280,
+    height: 900,
+    settings: {
+      enableJavaScriptEvaluation: true,
+      suppressCodeGenerationFromStringsWarning: true,
+      suppressInsecureJavaScriptEnvironmentWarning: true,
+      disableCSSFileLoading: true,
+      disableJavaScriptFileLoading: true,
+      handleDisabledFileLoadingAsSuccess: true,
+    },
+  });
+
+  try {
+    const origError = win.console.error.bind(win.console);
+    win.console.error = (...args) => {
+      consoleErrors.push(args.map((a) => (a && a.message ? a.message : String(a))).join(" "));
+      origError(...args);
+    };
+    const origAssert = win.console.assert.bind(win.console);
+    win.console.assert = (cond, ...args) => {
+      if (!cond) {
+        consoleErrors.push(args.length > 0 ? args.map(String).join(" ") : "Assertion failed");
+      }
+      origAssert(cond, ...args);
+    };
+
+    win.addEventListener("error", (ev) => {
+      pageErrors.push(String(ev.error?.message || ev.message || "Script error"));
+    });
+    win.addEventListener("unhandledrejection", (ev) => {
+      pageErrors.push(String(ev.reason?.message || ev.reason || "Unhandled promise rejection"));
+    });
+
+    const rawHtml = fs.readFileSync(resolved.absPath, "utf-8");
+    const html = inlineLocalScriptsForDom(rawHtml, path.dirname(resolved.absPath));
+    win.document.open();
+    win.document.write(html);
+    win.document.close();
+
+    await Promise.race([
+      win.happyDOM.waitUntilComplete(),
+      new Promise((_resolve, reject) =>
+        setTimeout(() => reject(new Error(`happy-dom timed out after ${opts.timeoutMs}ms`)), opts.timeoutMs),
+      ),
+    ]);
+
+    const doc = win.document;
+    const bodyText = (doc.body?.innerText || doc.body?.textContent || "").trim();
+    const counts = {
+      tables: doc.querySelectorAll("table").length,
+      rows: doc.querySelectorAll("tr").length,
+      buttons: doc.querySelectorAll("button").length,
+      inputs: doc.querySelectorAll("input,select,textarea").length,
+      headings: doc.querySelectorAll("h1,h2,h3").length,
+    };
+
+    let custom = null;
+    if (opts.evalJs) {
+      try {
+        custom = await Promise.resolve(win.eval(`(${customExpr})`));
+      } catch (err) {
+        pageErrors.push(String(err?.message || err));
+      }
+    }
+
+    return buildResult({
+      mode: "happy-dom",
+      layoutChecked: false,
+      dom: {
+        title: doc.title || "",
+        bodyTextLen: bodyText.length,
+        minTextPass: bodyText.length >= opts.minText,
+        counts,
+        zeroSizeInteractive: 0,
+        zeroSizeSelectors: [],
+        custom,
+      },
+      minText: opts.minText,
+      consoleErrors,
+      pageErrors,
+      screenshot: "",
+    });
+  } finally {
+    await win.happyDOM.close().catch(() => {});
+  }
+}
+
+function findChromeBinary() {
+  const candidates = [
+    process.env.PI_VERIFY_UI_CHROME,
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+  ].filter(Boolean);
+  for (const bin of candidates) {
+    if (fs.existsSync(bin)) return bin;
+  }
+  return null;
+}
+
+function killProcessTree(child) {
+  if (!child || !child.pid || child.exitCode !== null) return;
+  try {
+    process.kill(-child.pid, "SIGTERM");
+  } catch {
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      return;
+    }
+  }
+  const deadline = Date.now() + 400;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) return;
+    try {
+      process.kill(child.pid, 0);
+    } catch {
+      return;
+    }
+  }
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Ignore already-exited child.
+    }
+  }
+}
+
+function createCdpClient(wsUrl, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl);
+    let nextId = 1;
+    const pending = new Map();
+    const listeners = new Map();
+    const timer = setTimeout(() => {
+      reject(new Error(`CDP WebSocket connect timed out after ${timeoutMs}ms`));
+      try {
+        ws.close();
+      } catch {
+        // Ignore close error.
+      }
+    }, timeoutMs);
+
+    ws.addEventListener("open", () => {
+      clearTimeout(timer);
+      resolve({
+        on(method, fn) {
+          const arr = listeners.get(method) || [];
+          arr.push(fn);
+          listeners.set(method, arr);
+        },
+        send(method, params = {}) {
+          const id = nextId++;
+          return new Promise((res, rej) => {
+            const callTimer = setTimeout(() => {
+              pending.delete(id);
+              rej(new Error(`CDP call timed out: ${method}`));
+            }, timeoutMs);
+            pending.set(id, {
+              resolve: (val) => {
+                clearTimeout(callTimer);
+                res(val);
+              },
+              reject: (err) => {
+                clearTimeout(callTimer);
+                rej(err);
+              },
+            });
+            ws.send(JSON.stringify({ id, method, params }));
+          });
+        },
+        close() {
+          for (const [, p] of pending) {
+            p.reject(new Error("CDP connection closed"));
+          }
+          pending.clear();
+          try {
+            ws.close();
+          } catch {
+            // Ignore close error.
+          }
+        },
+      });
+    });
+
+    ws.addEventListener("message", (ev) => {
+      let msg;
+      try {
+        msg = JSON.parse(String(ev.data));
+      } catch {
+        return;
+      }
+      if (typeof msg.id === "number") {
+        const entry = pending.get(msg.id);
+        if (!entry) return;
+        pending.delete(msg.id);
+        if (msg.error) {
+          entry.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+        } else {
+          entry.resolve(msg.result || {});
+        }
+        return;
+      }
+      if (msg.method) {
+        const arr = listeners.get(msg.method);
+        if (arr) {
+          for (const fn of arr) {
+            fn(msg.params || {});
+          }
+        }
+      }
+    });
+
+    ws.addEventListener("error", (ev) => {
+      clearTimeout(timer);
+      reject(new Error(`CDP WebSocket error: ${ev.message || "connection failed"}`));
+    });
+  });
+}
+
+async function runChromeCdpMode(resolved, opts, customExpr) {
+  const chromeBin = findChromeBinary();
+  if (!chromeBin) {
+    throw new Error("Google Chrome / Chromium binary not found (use --dom for virtual DOM checks or set PI_VERIFY_UI_CHROME)");
+  }
+
+  const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-verify-ui-chrome-"));
+  const chromeArgs = [
+    "--headless=new",
+    "--remote-debugging-port=0",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-gpu",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--metrics-recording-only",
+    "--mute-audio",
+    "--allow-file-access-from-files",
+    "--window-size=1280,900",
+    `--user-data-dir=${profileDir}`,
+    "about:blank",
+  ];
+
+  const chrome = spawn(chromeBin, chromeArgs, {
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  const sigHandler = () => {
+    killProcessTree(chrome);
+    fs.rmSync(profileDir, { recursive: true, force: true });
+    process.exit(130);
+  };
+  process.once("SIGINT", sigHandler);
+  process.once("SIGTERM", sigHandler);
+
+  let client = null;
+  try {
+    const port = await new Promise((resolve, reject) => {
+      let stderrBuf = "";
+      const timer = setTimeout(() => {
+        reject(new Error(`Chrome DevTools failed to start within ${opts.timeoutMs}ms: ${stderrBuf.slice(-300)}`));
+      }, opts.timeoutMs);
+
+      const onData = (chunk) => {
+        stderrBuf += chunk.toString("utf-8");
+        const match = stderrBuf.match(/DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)\//);
+        if (match) {
+          clearTimeout(timer);
+          chrome.stderr.off("data", onData);
+          resolve(Number.parseInt(match[1], 10));
+        }
+      };
+
+      chrome.stderr.on("data", onData);
+      chrome.once("exit", (code) => {
+        clearTimeout(timer);
+        reject(new Error(`Chrome exited early (${code}): ${stderrBuf.slice(-300)}`));
+      });
+    });
+
+    const listRes = await fetch(`http://127.0.0.1:${port}/json/list`);
+    if (!listRes.ok) {
+      throw new Error(`CDP /json/list failed with HTTP ${listRes.status}`);
+    }
+    const targets = await listRes.json();
+    const pageTarget = Array.isArray(targets) ? targets.find((t) => t.type === "page" && t.webSocketDebuggerUrl) : null;
+    if (!pageTarget) {
+      throw new Error("No debuggable Chrome page target found");
+    }
+
+    client = await createCdpClient(pageTarget.webSocketDebuggerUrl, opts.timeoutMs);
+    const consoleErrors = [];
+    const pageErrors = [];
+
+    client.on("Runtime.consoleAPICalled", (params) => {
+      const kind = String(params.type || "").toLowerCase();
+      if (kind !== "error" && kind !== "assert") return;
+      const args = Array.isArray(params.args) ? params.args : [];
+      const text = args
+        .map((a) => (a.value !== undefined ? String(a.value) : a.description || a.type || ""))
+        .filter(Boolean)
+        .join(" ");
+      consoleErrors.push(text || `console.${kind}`);
+    });
+
+    client.on("Runtime.exceptionThrown", (params) => {
+      const det = params.exceptionDetails || {};
+      const msg = det.exception?.description || det.exception?.value || det.text || "Uncaught exception";
+      pageErrors.push(String(msg));
+    });
+
+    await client.send("Page.enable");
+    await client.send("Runtime.enable");
+
+    const loadPromise = new Promise((resolve) => {
+      const timer = setTimeout(resolve, opts.timeoutMs);
+      client.on("Page.loadEventFired", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+
+    await client.send("Page.navigate", { url: resolved.url });
+    await loadPromise;
+    await new Promise((r) => setTimeout(r, 150));
+
+    const evalRes = await client.send("Runtime.evaluate", {
+      expression: buildDomInspectionScript(opts.minText, customExpr),
+      returnByValue: true,
+      awaitPromise: true,
+    });
+
+    if (evalRes.exceptionDetails) {
+      const det = evalRes.exceptionDetails;
+      pageErrors.push(String(det.exception?.description || det.text || "DOM evaluation failed"));
+    }
+
+    const dom = evalRes.result && typeof evalRes.result.value === "object" && evalRes.result.value
+      ? evalRes.result.value
+      : {};
+
+    if (opts.screenshot) {
+      const shotRes = await client.send("Page.captureScreenshot", { format: "png" });
+      if (shotRes && typeof shotRes.data === "string") {
+        fs.mkdirSync(path.dirname(path.resolve(opts.screenshot)), { recursive: true });
+        fs.writeFileSync(opts.screenshot, Buffer.from(shotRes.data, "base64"));
+      }
+    }
+
+    return buildResult({
+      mode: "chrome-cdp",
+      layoutChecked: true,
+      dom,
+      minText: opts.minText,
+      consoleErrors,
+      pageErrors,
+      screenshot: opts.screenshot,
+    });
+  } finally {
+    process.off("SIGINT", sigHandler);
+    process.off("SIGTERM", sigHandler);
+    if (client) client.close();
+    killProcessTree(chrome);
+    fs.rmSync(profileDir, { recursive: true, force: true });
+  }
+}
+
+async function main() {
+  let parsed;
+  try {
+    parsed = parseArgs(process.argv.slice(2));
+  } catch (err) {
+    process.stdout.write(`${JSON.stringify({ ok: false, error: err.message })}\n`);
+    process.exit(2);
+  }
+
+  if (parsed.help || !parsed.opts.target) {
+    printHelp();
+    process.exit(parsed.help ? 0 : 2);
+  }
+
+  const { opts } = parsed;
+  try {
+    const resolved = resolveTarget(opts.target);
+    const customExpr = readCustomExpr(opts.evalJs);
+    const result = opts.dom
+      ? await runDomMode(resolved, opts, customExpr)
+      : await runChromeCdpMode(resolved, opts, customExpr);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    process.exit(result.ok ? 0 : 1);
+  } catch (err) {
+    process.stdout.write(`${JSON.stringify({ ok: false, error: String(err?.message || err) })}\n`);
+    process.exit(1);
+  }
+}
+
+void main();

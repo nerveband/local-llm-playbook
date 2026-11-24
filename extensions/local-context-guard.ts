@@ -277,6 +277,56 @@ export function extractAgentBrowserSessions(cmd: string): { opened: string[]; cl
   return { opened, closed };
 }
 
+/** Track repeated write/edit churn against a single file (filename-agnostic). */
+export function evaluateFileModifyChurn(
+  counts: Map<string, number>,
+  rawPath: string,
+): { path: string; count: number; shouldNudge: boolean } | null {
+  const norm = String(rawPath || "").trim().replace(/^\.\//, "");
+  if (!norm) return null;
+  const count = (counts.get(norm) ?? 0) + 1;
+  counts.set(norm, count);
+  const shouldNudge = count >= 8 && (count - 8) % 4 === 0;
+  return { path: norm, count, shouldNudge };
+}
+
+/** Classify repeated turn-by-turn external CLI families that should be batched. */
+export function extractCliCommandFamily(cmd: string): string | null {
+  if (!cmd) return null;
+  if (/\bagent-browser\b/.test(cmd)) return "agent-browser";
+  if (/\bbrowser-use\b/.test(cmd)) return "browser-use";
+  if (/^\s*(?:[A-Z_][A-Z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+)*(?:curl|wget|http)\b/.test(cmd)) {
+    return "http-cli";
+  }
+  return null;
+}
+
+/** Normalize an error signature across non-consecutive turns for strategy-pivot detection. */
+export function normalizeErrorClass(toolName: string, errorText: string): string | null {
+  const lines = String(errorText || "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  if (lines.length === 0) return null;
+  const salient =
+    lines.find((l) =>
+      /\b(?:Error|Exception|AssertionError|ENOENT|EACCES|SyntaxError|TypeError|ReferenceError|ValueError|KeyError|FileNotFoundError|failed)\b|\[E_[A-Z_]+\]/i.test(
+        l,
+      ),
+    ) ?? lines[0];
+  const norm = salient
+    .replace(/\b\d+#[A-Za-z0-9]{2,4}\b/g, "<ref>")
+    .replace(/:\d+(?::\d+)?\b/g, ":<n>")
+    .replace(/"[^"\r\n]{1,80}"/g, "<str>")
+    .replace(/'[^'\r\n]{1,80}'/g, "<str>")
+    .replace(/\b\d+\b/g, "<n>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase()
+    .slice(0, 100);
+  return norm ? `${toolName}:${norm}` : null;
+}
+
 function resolveWorkspacePath(filePath: string, cwd: string): string | null {
   const trimmed = filePath.trim();
   if (!trimmed) return null;
@@ -1258,6 +1308,9 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
   const baselineLintCounts = new Map<string, number>();
   const fileFailureStreak = new Map<string, number>();
   const fileReadCounts = new Map<string, number>();
+  const fileModifyCounts = new Map<string, number>();
+  const cliFamilyCounts = new Map<string, number>();
+  const errorClassCounts = new Map<string, number>();
   const workspaceScratchFiles = new Set<string>();
   const openBrowserSessions = new Set<string>();
 
@@ -1279,6 +1332,9 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     baselineLintCounts.clear();
     fileFailureStreak.clear();
     fileReadCounts.clear();
+    fileModifyCounts.clear();
+    cliFamilyCounts.clear();
+    errorClassCounts.clear();
     workspaceScratchFiles.clear();
   }
 
@@ -1580,12 +1636,42 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     const fullText = textBlocks.map((block) => block.text).join("\n");
     const lineCount = fullText ? fullText.split(/\r?\n/).length : 0;
 
+    if (event.isError) {
+      const errClass = normalizeErrorClass(toolName, fullText);
+      if (errClass) {
+        const errCount = (errorClassCounts.get(errClass) ?? 0) + 1;
+        errorClassCounts.set(errClass, errCount);
+        if (errCount >= 3 && (errCount - 3) % 2 === 0) {
+          appendLocalTrace("local-context-guard", "error_pivot_hint", {
+            tool: toolName,
+            errClass,
+            count: errCount,
+          });
+          hints.push(
+            `[Strategy pivot hint: Same ${toolName} error pattern occurred ${errCount} times in this session. Stop making minor tweaks to the same failing approach; step back, inspect the root cause directly, or switch to a simpler method.]`,
+          );
+        }
+      }
+    }
+
     const callId = String((event as { toolCallId?: string }).toolCallId || "last");
     const baseLintCount = baselineLintCounts.get(callId) ?? 0;
     baselineLintCounts.delete(callId);
 
     if (toolName === "write" || toolName === "edit") {
       const targetPath = String(event.input?.path ?? event.input?.file_path ?? "");
+      if (targetPath) {
+        const churn = evaluateFileModifyChurn(fileModifyCounts, targetPath);
+        if (churn?.shouldNudge) {
+          appendLocalTrace("local-context-guard", "file_churn", {
+            path: churn.path,
+            count: churn.count,
+          });
+          hints.push(
+            `[Edit churn hint: Modified ${path.basename(churn.path)} ${churn.count} times in this session. Stop micro-iterating on the same file: batch remaining edits, record any blocker in notes.md, or advance to the next deliverable.]`,
+          );
+        }
+      }
       if (event.isError && targetPath) {
         const prevStreak = (fileFailureStreak.get(targetPath) ?? 0) + 1;
         fileFailureStreak.set(targetPath, prevStreak);
@@ -1688,10 +1774,31 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
 
       if (/\bpi-verify-ui\b/.test(cmd)) {
         piVerifyUiRan = true;
-      } else if (!piVerifyUiRan && /\bagent-browser\s+open\b/.test(cmd)) {
+      } else if (!piVerifyUiRan && /\b(?:agent-browser|browser-use)\b/.test(cmd)) {
         hints.push(
-          "[Browser efficiency hint: Run pi-verify-ui /ABS/PATH/file.html (with optional --eval-js) first for a single-shot headless Chromium DOM, layout, and error audit before running agent-browser calls.]",
+          "[Browser efficiency hint: Do not drive agent-browser or browser-use manually. Use pi-verify-ui --dom /ABS/PATH/file.html --eval-js ... for fast virtual DOM checks, or pi-verify-ui /ABS/PATH/file.html --eval-js ... for single-shot headless Chrome verification.]",
         );
+      }
+
+      const cliFamily = extractCliCommandFamily(cmd);
+      if (cliFamily) {
+        const famCount = (cliFamilyCounts.get(cliFamily) ?? 0) + 1;
+        cliFamilyCounts.set(cliFamily, famCount);
+        if (famCount >= 6 && (famCount - 6) % 4 === 0) {
+          appendLocalTrace("local-context-guard", "cli_loop_hint", {
+            family: cliFamily,
+            count: famCount,
+          });
+          if (cliFamily === "agent-browser" || cliFamily === "browser-use") {
+            hints.push(
+              `[CLI batching hint: ${famCount} ${cliFamily} calls in this session. Stop turn-by-turn browser CLI calls and use pi-verify-ui --dom /ABS/PATH/file.html --eval-js ... (fast virtual DOM) or pi-verify-ui /ABS/PATH/file.html --eval-js ... (single-shot real headless Chrome).]`,
+            );
+          } else {
+            hints.push(
+              `[CLI batching hint: ${famCount} ${cliFamily} calls in this session. Batch remaining requests into a single script or compound command instead of calling ${cliFamily} turn-by-turn.]`,
+            );
+          }
+        }
       }
 
       if (
@@ -1732,20 +1839,20 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
           consecutiveAgentBrowserEvals % AGENT_BROWSER_EVAL_BATCH_NUDGE === 0
         ) {
           hints.push(
-            `[Browser efficiency hint: ${consecutiveAgentBrowserEvals} consecutive agent-browser eval calls. Batch all remaining DOM and interaction assertions into 1 compound IIFE returning compact JSON, then run agent-browser close.]`,
+            `[Browser efficiency hint: ${consecutiveAgentBrowserEvals} consecutive agent-browser eval calls. Switch to a single pi-verify-ui --dom /ABS/PATH/file.html --eval-js ... or pi-verify-ui /ABS/PATH/file.html --eval-js ... call and close any open agent-browser session.]`,
           );
         }
       } else {
         consecutiveAgentBrowserEvals = 0;
       }
 
-      if (!event.isError || /\bagent-browser\b/.test(cmd)) {
+      if (!event.isError || /\b(?:pi-verify-ui|agent-browser)\b/.test(cmd)) {
         consecutiveVerifyScriptErrors = 0;
       } else if (VERIFY_SCRIPT_CMD_RE.test(cmd)) {
         consecutiveVerifyScriptErrors += 1;
         if (consecutiveVerifyScriptErrors >= 2) {
           hints.push(
-            '[Browser verification nudge: Stop debugging fragile Node DOM/regex stubs. Open the built HTML directly in real headless Chromium using AGENT_BROWSER_SESSION="ui-$$" agent-browser open file:///ABS/PATH/review.html, run snapshot -i or eval, and close with agent-browser close.]',
+            "[Browser verification nudge: Stop debugging fragile custom DOM/regex stubs. Use pi-verify-ui --dom /ABS/PATH/file.html --eval-js ... for fast Node happy-dom checks, or pi-verify-ui /ABS/PATH/file.html --eval-js ... for single-shot real headless Chrome verification.]",
           );
         }
       }

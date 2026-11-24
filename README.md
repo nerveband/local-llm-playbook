@@ -78,7 +78,7 @@ pi-local --surogate --print-cmd
 - [`bin/pi-local`](bin/pi-local): Interactive picker + auto server lifecycle manager + lean Pi launcher (`pi-local --help`).
 - [`bin/pi-preflight`](bin/pi-preflight): Zero-PII workspace schema profiler with bounded `distinct<=20` low-cardinality annotations for `--preflight`.
 - [`bin/pi-outline`](bin/pi-outline): Fast AST outline extractor for Python and JS/TS files (`class`, `def`, top-level symbols).
-- [`bin/pi-verify-ui`](bin/pi-verify-ui): Single-shot headless Chromium audit tool checking DOM counts, zero-size interactive controls, console errors, and page errors.
+- [`bin/pi-verify-ui`](bin/pi-verify-ui): Zero-daemon two-tier UI verification CLI supporting fast in-process Node `happy-dom` (`--dom`, `<200ms`) and single-shot real headless Chrome CDP (default, checking DOM counts, layout geometry / zero-size controls, console/page errors, custom `--eval-js`, and PNG screenshots).
 - [`scripts/inkling-omlx`](scripts/inkling-omlx): Launches Inkling 2 Mini on `oMLX 0.8.2 + m1_overlay` (`depth=6 + suffix_policy + --m1-fast + --affine4`, port `18089`).
 - [`scripts/ornith-splash`](scripts/ornith-splash): Launches Ornith 1.5 35B-A3B on `Splash + felkhayer DFlash2` (`--kv-format int8 --verify-rows auto --expert-memory off`, port `18092`).
 - [`scripts/surogate-splash`](scripts/surogate-splash): Launches Surogate 3.7 Flash on `Splash + incoai DFlash2` (`--kv-format int8 --verify-rows auto --cached-states int8`, port `18091`).
@@ -98,6 +98,10 @@ pi-local --surogate --print-cmd
 - [`PROMPTS.md`](PROMPTS.md): Copy-paste prompts for large tabular datasets, refactors, mid-session nudges, and phase transitions.
 
 ## Changelog
+
+- `2026-11-24` (Two-tier `pi-verify-ui` via pure Node CDP + `happy-dom`, plus general harness guardrails):
+  - **Zero-daemon UI verification across all 3 models:** Upgraded [`bin/pi-verify-ui`](bin/pi-verify-ui) to pure Node.js (`--dom` / `--fast` powered by `happy-dom` preinstalled via `NODE_PATH` in `bin/pi-local` for `<200ms` inner-loop checks with local `<script src>` inlining, plus default single-shot real headless Chrome CDP with process-group cleanup), eliminating `agent-browser` / `browser-use` daemon leaks and turn-by-turn UI polling across Inkling, Ornith, and Surogate.
+  - **General filename-agnostic guardrails:** Added per-file `write+edit` churn detection (`evaluateFileModifyChurn`, nudging at `8, 12, 16`), session-wide repeated-CLI-family detection (`extractCliCommandFamily`), normalized non-consecutive identical-error strategy pivots (`normalizeErrorClass`), and automatic Splash thinking-budget escalation after `3` consecutive cap hits (`resolveAdaptiveSplashThinkingBudget` in [`extensions/local-omlx-meter.ts`](extensions/local-omlx-meter.ts), resetting cleanly once under budget).
 
 - `2026-11-24` (v2 harness reliability, SSD storage migration, and full 3-model verification at `479b3ce`):
   - **Storage migration (no `--persistent-cache`):** Moved `lamq-models` (`8.8G`), `~/.omlx/models` (`21G`), and `~/.cache/huggingface` (`12G`) to `/Volumes/Extreme SSD` via symlinks (`103Gi` free on `/`, `2.9Ti` free on Extreme SSD) while keeping Splash `--max-cache-disk 0` and zero LoRA training.
