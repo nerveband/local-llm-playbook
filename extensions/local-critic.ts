@@ -121,6 +121,15 @@ export function collectCriticBundle(cwd: string): string {
   return sections.join("\n\n");
 }
 
+export function isFalsePositiveInlineDataDefect(defect: string): boolean {
+  const s = String(defect || "");
+  return (
+    /(embed|embeds|embedded|inline|inlined|single[- ]file|payload|byte)/i.test(s) &&
+    /(json|duplicates_report|review\.html|embedded data|inline data)/i.test(s) &&
+    /(size|large|bloated|too big|fetch\(|local file reference|separate file|violates|coupling|external)/i.test(s)
+  );
+}
+
 export function parseCriticVerdict(rawText: string): { pass: boolean; defects: string[] } {
   const hadToolCall = /<tool_call>|<function=/i.test(rawText);
   const cleaned = rawText
@@ -133,10 +142,13 @@ export function parseCriticVerdict(rawText: string): { pass: boolean; defects: s
   if (jsonMatch) {
     try {
       const obj = JSON.parse(jsonMatch[0]) as { pass?: boolean; defects?: unknown[] };
-      const defects = Array.isArray(obj.defects)
+      const rawDefects = Array.isArray(obj.defects)
         ? obj.defects.map((d) => String(d).trim()).filter((d) => d.length > 0)
         : [];
-      if (obj.pass === true && defects.length === 0) return { pass: true, defects: [] };
+      const defects = rawDefects.filter((d) => !isFalsePositiveInlineDataDefect(d));
+      if ((obj.pass === true || rawDefects.length > 0) && defects.length === 0) {
+        return { pass: true, defects: [] };
+      }
       if (defects.length > 0) return { pass: false, defects };
     } catch {
       // Fallback to text parsing.
@@ -147,7 +159,8 @@ export function parseCriticVerdict(rawText: string): { pass: boolean; defects: s
   const bullets = cleaned
     .split(/\r?\n/)
     .map((l) => l.replace(/^\s*[-*\d.)]+\s*/, "").trim())
-    .filter((l) => l.length > 8 && !/^\{|\}$/.test(l) && !/^<\/?(tool_call|function|parameter)/i.test(l));
+    .filter((l) => l.length > 8 && !/^\{|\}$/.test(l) && !/^<\/?(tool_call|function|parameter)/i.test(l))
+    .filter((l) => !isFalsePositiveInlineDataDefect(l));
   return bullets.length > 0 ? { pass: false, defects: bullets.slice(0, 6) } : { pass: true, defects: [] };
 }
 

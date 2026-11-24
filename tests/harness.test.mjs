@@ -437,3 +437,25 @@ test("isWorkspaceScratchScript and pi-verify-ui zeroSizeSelectors + file input e
     assert.deepEqual(parsed.zeroSizeSelectors, ["button#zeroBtn.tiny-btn"]);
   });
 });
+
+test("parseCriticVerdict filters inline/embedded JSON false positives while preserving real defects", () => {
+  const surogateFp = JSON.stringify({
+    pass: false,
+    defects: [
+      "build_review_html.py embeds the entire duplicates_report.json into review.html via /*@__INLINE__*/ replacement, producing a 172641-byte single file; this violates the no-external-URLs and file://-safe standalone requirements by coupling the builder to a large embedded payload rather than loading data via a local file reference.",
+    ],
+  });
+  assert.deepEqual(parseCriticVerdict(surogateFp), { pass: true, defects: [] });
+
+  const ornithMixed = JSON.stringify({
+    pass: false,
+    defects: [
+      "review.html embeds 1.14 MB of inline JSON directly in HTML instead of loading duplicates_report.json via fetch(), making the file too large.",
+      "apply_decisions.py synthesizes decisions deterministically instead of reading decisions.json.",
+    ],
+  });
+  assert.deepEqual(parseCriticVerdict(ornithMixed), {
+    pass: false,
+    defects: ["apply_decisions.py synthesizes decisions deterministically instead of reading decisions.json."],
+  });
+});

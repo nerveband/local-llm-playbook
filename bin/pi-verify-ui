@@ -62,12 +62,26 @@ cleanup() {
   pkill -TERM -f -- "AGENT_BROWSER_SESSION=$SESSION" >/dev/null 2>&1 || true
   if [[ "${PI_VERIFY_UI_SWEEP:-0}" == "1" ]]; then
     pkill -TERM -f -- "agent-browser-darwin-arm64" >/dev/null 2>&1 || true
+    pkill -TERM -f -- "agent-browser-chrome-" >/dev/null 2>&1 || true
+    sleep 0.2
+    pkill -KILL -f -- "agent-browser-darwin-arm64" >/dev/null 2>&1 || true
+    pkill -KILL -f -- "agent-browser-chrome-" >/dev/null 2>&1 || true
   else
+    typeset -a new_pids=()
     for ab_pid in ${(f)"$(pgrep -f 'agent-browser-darwin-arm64' 2>/dev/null || true)"}; do
       if [[ -n "$ab_pid" && "$AB_BEFORE" != *" $ab_pid "* ]]; then
         kill -TERM "$ab_pid" >/dev/null 2>&1 || true
+        new_pids+=("$ab_pid")
       fi
     done
+    if [[ ${#new_pids[@]} -gt 0 ]]; then
+      sleep 0.2
+      for ab_pid in "${new_pids[@]}"; do
+        if kill -0 "$ab_pid" >/dev/null 2>&1; then
+          kill -KILL "$ab_pid" >/dev/null 2>&1 || true
+        fi
+      done
+    fi
   fi
 }
 trap cleanup EXIT INT TERM
