@@ -5,6 +5,34 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { appendLocalTrace } from "./local-trace.ts";
+
+interface AdaptiveEscalationState {
+  offset: number;
+  errorStreak: number;
+  cleanStreak: number;
+  criticPending?: boolean;
+}
+
+function updateEscalationSignal(kind: "error" | "clean"): void {
+  const g = globalThis as typeof globalThis & { __piLocalEscalation?: AdaptiveEscalationState };
+  const st = g.__piLocalEscalation ?? (g.__piLocalEscalation = { offset: 0, errorStreak: 0, cleanStreak: 0 });
+  if (kind === "error") {
+    st.errorStreak += 1;
+    st.cleanStreak = 0;
+    if (st.errorStreak >= 2 && st.offset < 2) {
+      st.offset += 1;
+      st.errorStreak = 0;
+    }
+  } else {
+    st.cleanStreak += 1;
+    st.errorStreak = 0;
+    if (st.cleanStreak >= 2 && st.offset > 0) {
+      st.offset -= 1;
+      st.cleanStreak = 0;
+    }
+  }
+}
 
 const DEFAULT_MAX_TOOL_CHARS = Number(process.env.PI_LOCAL_MAX_TOOL_CHARS || 6000);
 const DEFAULT_MAX_TOOL_LINES = Number(process.env.PI_LOCAL_MAX_TOOL_LINES || 120);
@@ -541,10 +569,145 @@ export function repairEditArguments(args: Record<string, unknown>, cwd: string):
         edit.newText = newText.trim();
       }
       changed = true;
+      continue;
+    }
+
+    // Cascade 4: unique contiguous line-block match after single/double/backtick quote normalization.
+    if (/['"`]/.test(oldText) && oldLines.length >= 1 && oldLines.some((l) => l.trim().length > 0)) {
+      const normQuotes = (s: string): string => s.trim().replace(/['"`]/g, '"');
+      const quoteMatches: number[] = [];
+      for (let s = 0; s <= diskSegs.length - oldLines.length; s++) {
+        let ok = true;
+        for (let k = 0; k < oldLines.length; k++) {
+          if (normQuotes(diskSegs[s + k].text) !== normQuotes(oldLines[k])) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) {
+          quoteMatches.push(s);
+          if (quoteMatches.length > 1) break;
+        }
+      }
+      if (quoteMatches.length === 1) {
+        const startSegIdx = quoteMatches[0];
+        const endSegIdx = startSegIdx + oldLines.length - 1;
+        const startByte = diskSegs[startSegIdx].start;
+        const endByte =
+          diskSegs[endSegIdx].start +
+          diskSegs[endSegIdx].text.length +
+          (endedWithNewline ? diskSegs[endSegIdx].eol.length : 0);
+        const exactSlice = diskText.slice(startByte, endByte);
+        if (exactSlice && countLiteralOccurrences(diskText, exactSlice) === 1) {
+          const oldNonEmpty = oldLines.filter((l) => l.trim().length > 0);
+          const diskNonEmpty = diskSegs
+            .slice(startSegIdx, endSegIdx + 1)
+            .map((seg) => seg.text)
+            .filter((l) => l.trim().length > 0);
+          edit.oldText = exactSlice;
+          edit.newText = shiftBlockIndent(newText, oldNonEmpty, diskNonEmpty);
+          changed = true;
+        }
+      }
     }
   }
 
   return changed;
+}
+
+const SECRET_PATTERNS: { label: string; regex: RegExp }[] = [
+  { label: "AWS Access Key ID", regex: /\bAKIA[0-9A-Z]{16}\b/ },
+  { label: "PEM Private Key", regex: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/ },
+  { label: "GitHub Token", regex: /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/ },
+  { label: "API Secret Key", regex: /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{24,}\b/ },
+];
+
+/** Detect high-confidence hardcoded credentials before writing content to disk. */
+export function detectHardcodedSecrets(text: string): string | null {
+  if (!text) return null;
+  for (const pat of SECRET_PATTERNS) {
+    if (pat.regex.test(text)) {
+      return pat.label;
+    }
+  }
+  return null;
+}
+
+export interface FileLintResult {
+  syntaxError: string | null;
+  lintErrors: string[];
+}
+
+function runToolLines(cmd: string, args: string[], cwd: string): { ok: boolean; lines: string[]; raw: string } {
+  try {
+    execFileSync(cmd, args, {
+      cwd,
+      timeout: 5000,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { ok: true, lines: [], raw: "" };
+  } catch (err: any) {
+    if (err?.code === "ENOENT") {
+      return { ok: true, lines: [], raw: "" };
+    }
+    const raw = String(err?.stdout || err?.stderr || err?.message || "Check failed").trim();
+    const lines = raw
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    return { ok: false, lines, raw };
+  }
+}
+
+/** Run lightweight syntax + fast semantic lint checks (ruff / oxlint) on a modified file. */
+export function lintFileIssues(filePath: string, cwd: string): FileLintResult {
+  const absPath = resolveWorkspacePath(filePath, cwd);
+  if (!absPath || !fs.existsSync(absPath)) {
+    return { syntaxError: null, lintErrors: [] };
+  }
+  const ext = path.extname(absPath).toLowerCase();
+  let syntaxError: string | null = null;
+  const lintErrors: string[] = [];
+
+  if (ext === ".py") {
+    const pyCheck = runToolLines("python3", ["-m", "py_compile", absPath], cwd);
+    if (!pyCheck.ok) {
+      syntaxError = pyCheck.raw.length > 600 ? `${pyCheck.raw.slice(0, 600)}...` : pyCheck.raw;
+    }
+    const ruffRes = runToolLines(
+      "ruff",
+      ["check", "--select", "E9,F63,F7,F82,F841,F401", "--no-cache", "--output-format", "concise", absPath],
+      cwd,
+    );
+    if (!ruffRes.ok) {
+      for (const line of ruffRes.lines) {
+        if (!/^Found \d+ error/i.test(line) && !/^\[\*\]/.test(line)) {
+          lintErrors.push(line);
+        }
+      }
+    }
+  } else if (ext === ".js" || ext === ".mjs" || ext === ".cjs" || ext === ".ts" || ext === ".mts") {
+    if (ext === ".js" || ext === ".mjs" || ext === ".cjs") {
+      const nodeCheck = runToolLines("node", ["--check", absPath], cwd);
+      if (!nodeCheck.ok) {
+        syntaxError = nodeCheck.raw.length > 600 ? `${nodeCheck.raw.slice(0, 600)}...` : nodeCheck.raw;
+      }
+    }
+    const oxlintRes = runToolLines("oxlint", ["--quiet", absPath], cwd);
+    if (!oxlintRes.ok) {
+      for (const line of oxlintRes.lines) {
+        if (/^(?:×|x\s|error\b|\d+:\d+)/i.test(line) || line.includes(path.basename(absPath))) {
+          lintErrors.push(line);
+        }
+      }
+      if (lintErrors.length === 0 && oxlintRes.raw) {
+        lintErrors.push(oxlintRes.raw.slice(0, 400));
+      }
+    }
+  }
+
+  return { syntaxError, lintErrors };
 }
 
 function defaultHasTimeoutBinary(): boolean {
@@ -567,33 +730,19 @@ export function repairMacOsTimeoutCommand(cmd: string, hasTimeoutBin = defaultHa
 
 /** Run lightweight compile-time syntax validation after Python or JS write/edit calls. */
 export function checkSyntaxForFile(filePath: string, cwd: string): string | null {
-  const absPath = resolveWorkspacePath(filePath, cwd);
-  if (!absPath || !fs.existsSync(absPath)) return null;
-  const ext = path.extname(absPath).toLowerCase();
-  let cmd = "";
-  let cmdArgs: string[] = [];
-  if (ext === ".py") {
-    cmd = "python3";
-    cmdArgs = ["-m", "py_compile", absPath];
-  } else if (ext === ".js" || ext === ".mjs" || ext === ".cjs") {
-    cmd = "node";
-    cmdArgs = ["--check", absPath];
-  } else {
-    return null;
-  }
+  return lintFileIssues(filePath, cwd).syntaxError;
+}
 
+function isInsideGitRepo(cwd: string): boolean {
   try {
-    execFileSync(cmd, cmdArgs, {
+    execFileSync("git", ["rev-parse", "--is-inside-work-tree"], {
       cwd,
-      timeout: 5000,
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
     });
-    return null;
-  } catch (err: any) {
-    if (err?.code === "ENOENT") return null;
-    const raw = String(err?.stderr || err?.stdout || err?.message || "Syntax error").trim();
-    return raw.length > 600 ? `${raw.slice(0, 600)}...` : raw;
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -675,6 +824,8 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
   let consecutivePrematureRetries = 0;
   let lastAssistantSnapshot: Omit<AssistantTurnSnapshot, "hadToolCallsInSession"> | null = null;
   const bashStartTimes = new Map<string, number>();
+  const baselineLintCounts = new Map<string, number>();
+  const fileFailureStreak = new Map<string, number>();
   const openBrowserSessions = new Set<string>();
 
   function resetAllCounters(): void {
@@ -689,6 +840,8 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     consecutivePrematureRetries = 0;
     lastAssistantSnapshot = null;
     bashStartTimes.clear();
+    baselineLintCounts.clear();
+    fileFailureStreak.clear();
   }
 
   pi.on("session_start", () => {
@@ -731,12 +884,14 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       if (item.name === "edit") {
         if (repairEditArguments(args, ctx.cwd)) {
           repaired = true;
+          appendLocalTrace("local-context-guard", "tool_repair", { tool: "edit", path: String(args.path ?? args.file_path ?? "") });
         }
       } else if (item.name === "bash" && typeof args.command === "string") {
         const nextCmd = repairMacOsTimeoutCommand(args.command);
         if (nextCmd !== args.command) {
           args.command = nextCmd;
           repaired = true;
+          appendLocalTrace("local-context-guard", "tool_repair", { tool: "bash", kind: "strip_timeout" });
         }
       }
     }
@@ -751,17 +906,53 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     return repaired ? { message: event.message as any } : undefined;
   });
 
-  pi.on("tool_call", (event) => {
+  pi.on("tool_call", (event, ctx) => {
     const toolName = String(event.toolName || "");
     hadToolCallsInSession = true;
     consecutivePrematureRetries = 0;
     if (toolName === "phase_handoff") {
       return;
     }
+    const callId = String((event as { toolCallId?: string }).toolCallId || "last");
     if (toolName === "bash") {
-      bashStartTimes.set(String((event as { toolCallId?: string }).toolCallId || "last"), Date.now());
+      bashStartTimes.set(callId, Date.now());
     }
     const input = event.input as Record<string, unknown> | undefined;
+
+    if (toolName === "write" || toolName === "edit") {
+      if (process.env.PI_LOCAL_ALLOW_SECRETS !== "1") {
+        const textsToScan: string[] = [];
+        if (toolName === "write" && typeof input?.content === "string") {
+          textsToScan.push(input.content);
+        } else if (toolName === "edit" && input) {
+          if (typeof input.newText === "string") textsToScan.push(input.newText);
+          if (Array.isArray(input.edits)) {
+            for (const entry of input.edits) {
+              if (entry && typeof entry === "object") {
+                const rec = entry as Record<string, unknown>;
+                if (typeof rec.newText === "string") textsToScan.push(rec.newText);
+                if (Array.isArray(rec.lines)) textsToScan.push(rec.lines.join("\n"));
+              }
+            }
+          }
+        }
+        for (const candidate of textsToScan) {
+          const foundSecret = detectHardcodedSecrets(candidate);
+          if (foundSecret) {
+            appendLocalTrace("local-context-guard", "secret_blocked", { tool: toolName, label: foundSecret });
+            return {
+              block: true,
+              reason: `Security guard: blocked hardcoded ${foundSecret} before writing to disk. Read secrets from environment variables instead (or set PI_LOCAL_ALLOW_SECRETS=1 if intentional).`,
+            };
+          }
+        }
+      }
+
+      const targetPath = String(input?.path ?? input?.file_path ?? "");
+      if (targetPath && ctx?.cwd) {
+        baselineLintCounts.set(callId, lintFileIssues(targetPath, ctx.cwd).lintErrors.length);
+      }
+    }
     const sig = summarizeCallSignature(toolName, input);
     if (sig === lastCallSignature) {
       consecutiveSameCall += 1;
@@ -880,6 +1071,8 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
 
     if (event.isError) {
       consecutiveErrors += 1;
+      updateEscalationSignal("error");
+      appendLocalTrace("local-context-guard", "tool_error", { tool: toolName, streak: consecutiveErrors });
       const sig = summarizeCallSignature(toolName, event.input);
       const repeatedExact = sig === lastErrorSignature;
       lastErrorSignature = sig;
@@ -912,14 +1105,59 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     const fullText = textBlocks.map((block) => block.text).join("\n");
     const lineCount = fullText ? fullText.split(/\r?\n/).length : 0;
 
-    if ((toolName === "write" || toolName === "edit") && !event.isError) {
+    const callId = String((event as { toolCallId?: string }).toolCallId || "last");
+    const baseLintCount = baselineLintCounts.get(callId) ?? 0;
+    baselineLintCounts.delete(callId);
+
+    if (toolName === "write" || toolName === "edit") {
       const targetPath = String(event.input?.path ?? event.input?.file_path ?? "");
-      const syntaxErr = checkSyntaxForFile(targetPath, ctx.cwd);
-      if (syntaxErr) {
-        hints.push(
-          `[Auto syntax check FAILED for ${targetPath}:\n${syntaxErr}\nFix this syntax error immediately before running or moving on.]`,
-        );
+      if (event.isError && targetPath) {
+        const prevStreak = (fileFailureStreak.get(targetPath) ?? 0) + 1;
+        fileFailureStreak.set(targetPath, prevStreak);
+        if (prevStreak >= 3 && isInsideGitRepo(ctx.cwd)) {
+          appendLocalTrace("local-context-guard", "git_rollback_hint", { path: targetPath, streak: prevStreak });
+          hints.push(
+            `[Git recovery hint: ${prevStreak} consecutive edit/lint regressions on ${targetPath}. Inspect changes with bash('git diff -- ${targetPath}') or restore cleanly with bash('git checkout -- ${targetPath}') if the file drifted.]`,
+          );
+        }
+      } else if (!event.isError) {
+        const lintRes = lintFileIssues(targetPath, ctx.cwd);
+        const newLintCount = Math.max(0, lintRes.lintErrors.length - baseLintCount);
+        if (lintRes.syntaxError || newLintCount > 0) {
+          updateEscalationSignal("error");
+          const prevStreak = (fileFailureStreak.get(targetPath) ?? 0) + 1;
+          fileFailureStreak.set(targetPath, prevStreak);
+          appendLocalTrace("local-context-guard", "lint_delta", {
+            path: targetPath,
+            syntaxError: Boolean(lintRes.syntaxError),
+            newLintCount,
+            totalLintCount: lintRes.lintErrors.length,
+          });
+          const parts: string[] = [];
+          if (lintRes.syntaxError) {
+            parts.push(`Syntax error:\n${lintRes.syntaxError}`);
+          }
+          if (newLintCount > 0) {
+            parts.push(
+              `New semantic lint issues (${newLintCount} added, ${lintRes.lintErrors.length} total):\n${lintRes.lintErrors.slice(0, 8).join("\n")}`,
+            );
+          }
+          hints.push(
+            `[ACTION REQUIRED: Your ${toolName} on ${targetPath} introduced error(s):\n${parts.join("\n")}\nFix these immediately before running or moving on.]`,
+          );
+          if (prevStreak >= 3 && isInsideGitRepo(ctx.cwd)) {
+            appendLocalTrace("local-context-guard", "git_rollback_hint", { path: targetPath, streak: prevStreak });
+            hints.push(
+              `[Git recovery hint: ${prevStreak} consecutive edit/lint regressions on ${targetPath}. Run bash('git checkout -- ${targetPath}') if you want to restart cleanly from the last commit.]`,
+            );
+          }
+        } else {
+          updateEscalationSignal("clean");
+          if (targetPath) fileFailureStreak.delete(targetPath);
+        }
       }
+    } else if (!event.isError) {
+      updateEscalationSignal("clean");
     }
 
     if (toolName === "bash") {
@@ -930,6 +1168,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       if (startedAt !== undefined && SLOW_BASH_MS > 0) {
         const elapsedMs = Date.now() - startedAt;
         if (elapsedMs >= SLOW_BASH_MS) {
+          appendLocalTrace("local-context-guard", "bash_slow", { elapsedMs });
           hints.push(
             `[Runtime efficiency hint: That bash command took ${Math.round(elapsedMs / 1000)}s. Check for O(K^2) loops, unindexed joins, or mega-clusters on low-cardinality fields before re-running.]`,
           );
@@ -1071,6 +1310,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     if (!reason || consecutivePrematureRetries >= MAX_PREMATURE_RETRIES) return;
 
     consecutivePrematureRetries += 1;
+    appendLocalTrace("local-context-guard", "premature_stop", { reason, retry: consecutivePrematureRetries });
     ctx.ui?.notify?.(
       `Auto-continuing after premature stop (${reason}, retry ${consecutivePrematureRetries}/${MAX_PREMATURE_RETRIES})...`,
       "info",
