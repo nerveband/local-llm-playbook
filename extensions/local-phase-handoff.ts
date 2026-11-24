@@ -5,7 +5,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 
 const HANDOFF_FILENAME = ".pi-handoff.md";
 const HANDOFF_ARCHIVE_FILENAME = ".pi-handoff.last.md";
-const HIGH_CONTEXT_TOKENS = Number(process.env.PI_LOCAL_HANDOFF_TOKENS || 40000);
+const HIGH_CONTEXT_TOKENS = Number(process.env.PI_LOCAL_HANDOFF_TOKENS || 32000);
 const HIGH_CONTEXT_RATIO = 0.72;
 const MAX_AUTO_HANDOFFS = 3;
 
@@ -184,7 +184,7 @@ export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
         ...event.content,
         {
           type: "text",
-          text: `\n[Local speed notice: ${usage.tokens.toLocaleString()} tokens used (${pct}% of window). Local decode slows above 40K tokens. Update notes.md and call phase_handoff at the next clean milestone if more work remains.]`,
+          text: `\n[Local speed notice: ${usage.tokens.toLocaleString()} tokens used (${pct}% of window). Local decode slows above 32K tokens. Update notes.md and call phase_handoff at the next clean milestone if more work remains.]`,
         },
       ],
       ...(event.structuredContent !== undefined ? { structuredContent: event.structuredContent } : {}),
@@ -247,12 +247,12 @@ export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
       const result = await ctx.newSession({
         parentSession: currentSessionFile,
         withSession: async (newCtx) => {
+          newCtx.ui?.notify?.("Started next phase in a fresh session.", "info");
           if (newCtx.isIdle()) {
             await newCtx.sendUserMessage(promptForNewSession);
           } else {
             await newCtx.sendUserMessage(promptForNewSession, { deliverAs: "followUp" });
           }
-          newCtx.ui?.notify?.("Started next phase in a fresh session.", "info");
         },
       });
 

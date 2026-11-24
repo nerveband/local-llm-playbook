@@ -6,7 +6,7 @@ Personal playbook, extensions, copy-paste prompt templates, example Pi configura
 
 Global Pi setups often load cloud-oriented packages, skill catalogs, `codemode`, and extra tool definitions that can exceed `11,000` base tokens before your first message. On local Apple Silicon **oMLX** and **Splash** servers, every prefix-cache miss or compaction reset has to re-prefill that entire static prefix on-device.
 
-`pi-local` handles everything from one command: shows an interactive model picker when launched in a terminal, stops any competing local model so Inkling, Ornith, and Surogate never collide inside `64 GiB` RAM, starts the chosen server if it is stopped, strips heavy cloud tools (`--no-mcp --no-skills --no-extensions --exclude-tools codemode`), loads accurate per-turn local speed telemetry (`local-omlx-meter.ts` supporting both oMLX `usage` and Splash `timings`), caps oversized tool outputs before they bloat context (`local-context-guard.ts`), and triggers `phase_handoff` + `/next-phase` around `40K` tokens for clean phase transitions.
+`pi-local` handles everything from one command: shows an interactive model picker when launched in a terminal, stops any competing local model so Inkling, Ornith, and Surogate never collide inside `64 GiB` RAM, starts the chosen server if it is stopped, strips heavy cloud tools (`--no-mcp --no-skills --no-extensions --exclude-tools codemode`), loads accurate per-turn local speed telemetry (`local-omlx-meter.ts` supporting both oMLX `usage` and Splash `timings`), caps oversized tool outputs and blocks duplicate tool loops (`local-context-guard.ts`), and triggers `phase_handoff` + `/next-phase` around `32K` tokens for clean phase transitions.
 
 ### Measured baseline prompt reduction (Inkling 2 Mini on M1 Max)
 
@@ -66,18 +66,18 @@ pi-local --surogate --print-cmd
 
 ## Self-triggered phase handoffs and local safeguards
 
-- **[`extensions/local-phase-handoff.ts`](extensions/local-phase-handoff.ts):** Registers an LLM-callable `phase_handoff` tool, a `40K`-token (or `72%`, whichever comes first) speed notice on tool results, and a `/next-phase` command:
+- **[`extensions/local-phase-handoff.ts`](extensions/local-phase-handoff.ts):** Registers an LLM-callable `phase_handoff` tool, a `32K`-token (or `72%`, whichever comes first) speed notice on tool results, and a `/next-phase` command:
   - **Pause-for-review mode (`auto_continue: false`):** At a clean boundary, the model updates `notes.md`, writes `.pi-handoff.md` via `phase_handoff`, stops calling tools, and waits. Review deliverables and run `/next-phase` (with optional adjustment text) to launch the next phase in a brand-new session.
   - **Hands-free auto-continue mode (`auto_continue: true`):** When explicitly requested, calling `phase_handoff` with `auto_continue: true` causes `agent_end` to automatically invoke `/next-phase` (up to `3` automatic phase hops per run) and start the next phase in a fresh window without filling context.
 - **[`extensions/local-omlx-meter.ts`](extensions/local-omlx-meter.ts):** Replaces `pi-token-speed` during `pi-local` sessions (`--legacy-speed` restores the global extension). Resets TTFT and a live `500 ms` per-turn stopwatch on every `turn_start`, labels `prefill` and `tool-buf` phases cleanly instead of displaying false low numbers during buffered tool calls, estimates multi-token MTP deltas live, and snaps to authoritative **oMLX** `provider_stream_event` usage timing + `/api/status` cache/VRAM metrics at turn completion.
-- **[`extensions/local-context-guard.ts`](extensions/local-context-guard.ts):** Prefix-cache-safe insertion-time tool output diet (`--no-context-guard` disables). Keeps head + tail lines when noisy `bash`/`grep`/`find`/`ls` outputs exceed `6,000` chars (`120` lines), explicit `sed -n` slices exceed `12,000` chars (`220` lines), or `read` exceeds `20,000` chars (`400` lines), exempts skill, reference, and instruction docs (`SKILL.md`, `notes.md`, `PROMPT.md`, `/skills*/`, `/reference/*.md`) up to `36,000` chars, spills the complete raw output to `/tmp/pi-local-tool-logs/...`, and injects targeted recovery hints on multi-line heredoc failures or consecutive repeated errors.
+- **[`extensions/local-context-guard.ts`](extensions/local-context-guard.ts):** Prefix-cache-safe insertion-time tool output diet and loop guard (`--no-context-guard` disables). Keeps head + tail lines when noisy `bash`/`grep`/`find`/`ls` outputs exceed `6,000` chars (`120` lines), explicit `sed -n` slices exceed `12,000` chars (`220` lines), or `read` exceeds `20,000` chars (`400` lines), exempts skill, reference, and instruction docs (`SKILL.md`, `notes.md`, `PROMPT.md`, `/skills*/`, `/reference/*.md`) up to `36,000` chars, spills the complete raw output to `/tmp/pi-local-tool-logs/...`, hashes tool inputs with `sha256` to warn on the `2nd` identical call and block the `3rd` (even when `isError` is false), warns on succeeding multi-line bash heredocs (`>= 400` chars), and injects recovery hints on consecutive errors.
 
 ## Included files
 
 - [`bin/pi-local`](bin/pi-local): Interactive picker + auto server lifecycle manager + lean Pi launcher (`pi-local --help`).
 - [`extensions/local-omlx-meter.ts`](extensions/local-omlx-meter.ts): Phase-aware per-turn timer and **oMLX** telemetry speedometer.
-- [`extensions/local-context-guard.ts`](extensions/local-context-guard.ts): Prefix-cache-safe tool output trimmer (with disk spill) and consecutive tool-failure hints.
-- [`extensions/local-phase-handoff.ts`](extensions/local-phase-handoff.ts): Self-triggered `phase_handoff` tool, `40K`-token speed notice, and `/next-phase` session switcher.
+- [`extensions/local-context-guard.ts`](extensions/local-context-guard.ts): Prefix-cache-safe tool output trimmer (with disk spill), `sha256` exact-call loop guard, and heredoc/failure hints.
+- [`extensions/local-phase-handoff.ts`](extensions/local-phase-handoff.ts): Self-triggered `phase_handoff` tool, `32K`-token speed notice, and `/next-phase` session switcher.
 - [`scripts/install-local-extensions.sh`](scripts/install-local-extensions.sh): Installs `pi-handoff`, `pi-continue`, and `pi-subagents` into `~/.local/share/pi-local-extensions` and symlinks `pi-local`.
 - [`prompts/local-lean-rules.md`](prompts/local-lean-rules.md): Short system prompt rules for disk-backed state (`notes.md`), batched read-only schema checks, `read`/`edit` over `bash cat`/heredocs, direct `~/.config/skillshare/skills-shared/` path loading, `20`-line stdout cap, and `phase_handoff`.
 - [`configs/pi-models-local.example.json`](configs/pi-models-local.example.json): Local provider definitions (`inkling-local` on `18089`, `omlx-local` on `8000`, `surogate-local` on `18091` with `131072` context and `32768` max output).
@@ -86,6 +86,8 @@ pi-local --surogate --print-cmd
 - [`PROMPTS.md`](PROMPTS.md): Copy-paste prompts for large tabular datasets, refactors, mid-session nudges, and phase transitions.
 
 ## Changelog
+
+- `2026-11-23`: Upgraded `local-context-guard.ts` with a `sha256` exact-call loop guard (warns on 2nd repeat, blocks 3rd repeat even on `isError: false`) and heredoc warnings on succeeding `bash` calls, lowered `local-phase-handoff.ts` speed notice default to `32K` tokens and fired the fresh-session start toast before sending the Phase 2 prompt, and documented `--default-temp 0.2` (to avoid `0.0` greedy repetition loops), 7-level Inkling `reasoning_effort` mapping, concise script/compact JSON rules, and **oMLX `0.8.2`** prefix-cache caveats.
 
 - `2026-11-22`: Added Surogate 3.7 Flash (`--surogate`, `surogate-local/surogate` on port `18091`, managed by `surogate-splash` with Splash `1.7.0-m1` + DFlash2 + `bf16` KV/state + `2048` thinking cap + `128K` context), added `--thinking-token-budget 2048` default for Ornith in `splash-no-disk`, added 3-way mutual exclusion to `pi-local`, and added Splash `chunk.timings` extraction to `local-omlx-meter.ts`.
 

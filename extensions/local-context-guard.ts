@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -116,7 +117,8 @@ function trimWithHeadAndTail(
 function summarizeCallSignature(toolName: string, input: Record<string, unknown> | undefined): string {
   if (!input) return toolName;
   try {
-    return `${toolName}:${JSON.stringify(input).slice(0, 220)}`;
+    const hash = crypto.createHash("sha256").update(JSON.stringify(input)).digest("hex").slice(0, 16);
+    return `${toolName}:${hash}`;
   } catch {
     return toolName;
   }
@@ -132,15 +134,42 @@ function isLargeHeredocCommand(toolName: string, input: Record<string, unknown> 
 export default function localContextGuardExtension(pi: ExtensionAPI) {
   let consecutiveErrors = 0;
   let lastErrorSignature = "";
+  let lastCallSignature = "";
+  let consecutiveSameCall = 0;
 
   pi.on("session_start", () => {
     consecutiveErrors = 0;
     lastErrorSignature = "";
+    lastCallSignature = "";
+    consecutiveSameCall = 0;
   });
 
   pi.on("input", () => {
     consecutiveErrors = 0;
     lastErrorSignature = "";
+    lastCallSignature = "";
+    consecutiveSameCall = 0;
+  });
+
+  pi.on("tool_call", (event) => {
+    const toolName = String(event.toolName || "");
+    if (toolName === "phase_handoff") {
+      return;
+    }
+    const sig = summarizeCallSignature(toolName, event.input as Record<string, unknown> | undefined);
+    if (sig === lastCallSignature) {
+      consecutiveSameCall += 1;
+    } else {
+      lastCallSignature = sig;
+      consecutiveSameCall = 1;
+    }
+    if (consecutiveSameCall >= 3) {
+      return {
+        block: true,
+        reason:
+          "Loop guard: this exact tool call already ran twice with the same arguments. Do not repeat it again. Use the results you already have, move to the next deliverable, or update notes.md and call phase_handoff.",
+      };
+    }
   });
 
   pi.on("tool_result", (event, ctx) => {
@@ -150,23 +179,29 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     }
 
     const hints: string[] = [];
+    if (isLargeHeredocCommand(toolName, event.input)) {
+      hints.push(
+        "[Local tool hint: Avoid multi-line bash heredocs. Put scripts in .py files using write or edit so you do not burn output tokens rewriting inline code.]",
+      );
+    }
+
+    if (consecutiveSameCall === 2) {
+      hints.push(
+        "[Loop guard: exact duplicate tool call (2nd time in a row). Do not run this same command again. Move to the next step or update notes.md and call phase_handoff.]",
+      );
+    }
+
     if (event.isError) {
       consecutiveErrors += 1;
       const sig = summarizeCallSignature(toolName, event.input);
       const repeatedExact = sig === lastErrorSignature;
       lastErrorSignature = sig;
 
-      if (isLargeHeredocCommand(toolName, event.input)) {
-        hints.push(
-          "[Local tool hint: Avoid multi-line bash heredocs for editing or writing code. Use the edit or write tool directly so changes stay verifiable.]",
-        );
-      }
-
-      if (repeatedExact) {
+      if (repeatedExact && consecutiveSameCall !== 2) {
         hints.push(
           "[Tool recovery hint: Exact duplicate failing call detected. Change approach instead of repeating the same command or arguments.]",
         );
-      } else if (consecutiveErrors >= 2) {
+      } else if (!repeatedExact && consecutiveErrors >= 2) {
         hints.push(
           `[Tool recovery hint: ${consecutiveErrors} consecutive tool failures. Pause, read the exact error line or file schema with a short command, and fix the root cause before retrying.]`,
         );
