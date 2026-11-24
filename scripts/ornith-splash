@@ -1,0 +1,170 @@
+#!/bin/zsh
+set -eu
+
+ROOT="/Users/nerveband/Documents/Codex/2026-11-21/files-pasted-by-the-user-find"
+STATE="$ROOT/work/ornith-splash-live"
+PIDFILE="$STATE/server.pid"
+LOGFILE="$STATE/server.log"
+SPLASH_BIN="$HOME/.local/bin/splash-1.7.0-m1"
+MODEL_DIR="${ORNITH_MODEL_DIR:-$HOME/.omlx/models/PocketAiHub/Ornith-1.5-35B-A3B-Abliterated-MLX-4bit}"
+DRAFT_SPLASH="$HOME/.omlx/models/felkhayer/Ornith-1.5-35B-A3B-DFlash2-Splash"
+DRAFT_QWEN="$HOME/.omlx/models/incoai/Qwen3.6-35B-A3B-DFlash2"
+DRAFT="${ORNITH_DRAFT_DIR:-$DRAFT_SPLASH}"
+URL="http://127.0.0.1:18092"
+VERIFY_ROWS="${ORNITH_VERIFY_ROWS:-auto}"
+KV_FORMAT="${ORNITH_KV_FORMAT:-int8}"
+PREFILL_MODE="${ORNITH_PREFILL_MODE:-full}"
+MAX_MEMORY="${ORNITH_MAX_MEMORY:-34G}"
+THINK_BUDGET="${ORNITH_THINKING_BUDGET:-2048}"
+THINK_END_TEXT=$'\nI have the design ready. Let me write and verify the code now.\n</think>'
+
+is_serving() {
+  curl -sf --max-time 2 "$URL/v1/models" 2>/dev/null | /opt/homebrew/bin/python3.12 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    sys.exit(0 if any(m.get("id") == "ornith" for m in data.get("data", [])) else 1)
+except Exception:
+    sys.exit(1)
+'
+}
+
+stop_server() {
+  local pid=""
+  if [[ -f "$PIDFILE" ]]; then
+    pid=$(cat "$PIDFILE" 2>/dev/null || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      for _ in {1..30}; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+    fi
+    rm -f "$PIDFILE"
+  fi
+  if pgrep -f -- "splash-1\.7\.0-m1 serve .*--port 18092" >/dev/null 2>&1; then
+    pkill -TERM -f -- "splash-1\.7\.0-m1 serve .*--port 18092" 2>/dev/null || true
+    sleep 1
+    pkill -KILL -f -- "splash-1\.7\.0-m1 serve .*--port 18092" 2>/dev/null || true
+  fi
+}
+
+case "${1:-}" in
+  start)
+    if [[ ! -x "$SPLASH_BIN" ]]; then
+      print -u2 "Error: splash binary not found at $SPLASH_BIN"
+      exit 1
+    fi
+    if [[ ! -d "$MODEL_DIR" ]]; then
+      print -u2 "Error: Ornith model directory not found at $MODEL_DIR"
+      exit 1
+    fi
+    if [[ ! -d "$DRAFT" ]]; then
+      if [[ -d "$DRAFT_QWEN" ]]; then
+        DRAFT="$DRAFT_QWEN"
+      else
+        print -u2 "Error: DFlash2 draft model directory not found at $DRAFT"
+        exit 1
+      fi
+    fi
+    if is_serving; then
+      print "ornith-splash is already running on $URL (128K, resident experts, verify=$VERIFY_ROWS, kv=$KV_FORMAT)"
+      exit 0
+    fi
+    stop_server
+    mkdir -p "$STATE"
+
+    CMD=(
+      "$SPLASH_BIN"
+      serve
+      --model PocketAiHub/Ornith-1.5-35B-A3B-Abliterated-MLX-4bit
+      --model-dir "$MODEL_DIR"
+      --served-model-name ornith
+      --announce-served-name
+      --offline
+      --host 127.0.0.1
+      --port 18092
+      --no-webui
+      --idle-release off
+      --max-cache-disk 0
+      --max-context 131072
+      --max-memory "$MAX_MEMORY"
+      --expert-memory off
+      --language-only
+      --kv-format "$KV_FORMAT"
+      --state-format bf16
+      --prefill-mode "$PREFILL_MODE"
+      --verify-rows "$VERIFY_ROWS"
+      --cached-states int8
+      --activations bf16
+      --draft-model "$DRAFT"
+    )
+    if [[ "$THINK_BUDGET" =~ '^[0-9]+$' ]] && (( THINK_BUDGET > 0 )); then
+      CMD+=(--thinking-token-budget "$THINK_BUDGET" --thinking-end-text "$THINK_END_TEXT")
+    fi
+
+    nohup env HF_HUB_OFFLINE=1 "${CMD[@]}" >"$LOGFILE" 2>&1 </dev/null &!
+    pid=$!
+    print -r -- "$pid" >"$PIDFILE"
+
+    ready=0
+    for _ in {1..360}; do
+      if is_serving; then
+        ready=1
+        break
+      fi
+      if ! kill -0 "$pid" 2>/dev/null; then
+        print -u2 "ornith-splash failed to start; recent log:"
+        tail -n 30 "$LOGFILE" >&2 || true
+        stop_server
+        exit 1
+      fi
+      sleep 0.5
+    done
+    if [[ "$ready" != "1" ]]; then
+      print -u2 "Timed out waiting for $URL/v1/models"
+      tail -n 30 "$LOGFILE" >&2 || true
+      stop_server
+      exit 1
+    fi
+
+    print "Server is up on $URL; warming Ornith 1.5 35B-A3B (Splash DFlash2, 128K)..."
+    curl -sf --max-time 180 "$URL/v1/chat/completions" \
+      -H "Content-Type: application/json" \
+      -d '{"model":"ornith","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":1,"temperature":0}' \
+      >/dev/null
+    print "Ready and loaded: $URL (model: ornith, context 131072, kv=$KV_FORMAT, verify=$VERIFY_ROWS, thinking budget $THINK_BUDGET)"
+    ;;
+  stop)
+    stop_server
+    print "Stopped ornith-splash on $URL"
+    ;;
+  status)
+    pid=""
+    [[ -f "$PIDFILE" ]] && pid=$(cat "$PIDFILE" 2>/dev/null || true)
+    if is_serving; then
+      print "running (pid=${pid:-unknown}, url=$URL, model=ornith, ctx=131072, verify=$VERIFY_ROWS, kv=$KV_FORMAT, thinking_budget=$THINK_BUDGET)"
+      exit 0
+    fi
+    print "stopped"
+    exit 1
+    ;;
+  logs)
+    shift || true
+    if [[ ! -f "$LOGFILE" ]]; then
+      print -u2 "No log file at $LOGFILE"
+      exit 1
+    fi
+    if [[ "${1:-}" == "-f" ]]; then
+      exec tail -f "$LOGFILE"
+    fi
+    tail -n "${1:-50}" "$LOGFILE"
+    ;;
+  *)
+    print -u2 "Usage: ornith-splash start | stop | status | logs [-f|lines]"
+    exit 2
+    ;;
+esac

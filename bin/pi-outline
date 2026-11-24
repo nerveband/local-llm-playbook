@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Compact structural AST/regex outline for Python, JS/TS, HTML, and CSS files."""
+from __future__ import annotations
+
+import ast
+import pathlib
+import re
+import sys
+
+
+def outline_python(path: pathlib.Path, max_lines: int) -> list[str]:
+    src = path.read_text(encoding="utf-8", errors="replace")
+    tree = ast.parse(src, filename=str(path))
+    rows: list[str] = []
+
+    def visit(node: ast.AST, indent: int = 0) -> None:
+        pad = "  " * indent
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            args = [a.arg for a in node.args.posonlyargs + node.args.args]
+            if node.args.vararg:
+                args.append("*" + node.args.vararg.arg)
+            if node.args.kwonlyargs:
+                args.extend(a.arg for a in node.args.kwonlyargs)
+            if node.args.kwarg:
+                args.append("**" + node.args.kwarg.arg)
+            prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+            end_ln = getattr(node, "end_lineno", node.lineno)
+            rows.append(f"L{node.lineno}-L{end_ln} {pad}{prefix} {node.name}({', '.join(args[:8])}{', ...' if len(args) > 8 else ''})")
+            for child in node.body:
+                if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    visit(child, indent + 1)
+        elif isinstance(node, ast.ClassDef):
+            bases = [ast.unparse(b) for b in node.bases] if hasattr(ast, "unparse") else []
+            end_ln = getattr(node, "end_lineno", node.lineno)
+            base_str = f"({', '.join(bases)})" if bases else ""
+            rows.append(f"L{node.lineno}-L{end_ln} {pad}class {node.name}{base_str}")
+            for child in node.body:
+                visit(child, indent + 1)
+        elif isinstance(node, ast.Module):
+            for child in node.body:
+                visit(child, 0)
+
+    visit(tree)
+    return rows[:max_lines]
+
+
+JS_PATTERNS = [
+    re.compile(r"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)"),
+    re.compile(r"^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)(?:\s+extends\s+([A-Za-z0-9_$.]+))?"),
+    re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(([^)]*)\)\s*=>"),
+    re.compile(r"^\s*(?:export\s+)?(?:interface|type)\s+([A-Za-z_$][\w$]*)"),
+]
+
+CSS_PAT = re.compile(r"^([.#@A-Za-z][^{\n]{1,70})\{\s*$")
+HTML_PAT = re.compile(r"<(?:section|main|header|footer|nav|form|table|div)\b[^>]*(?:id|class)=[\"']([^\"']+)[\"']", re.I)
+
+
+def outline_generic(path: pathlib.Path, max_lines: int) -> list[str]:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    ext = path.suffix.lower()
+    rows: list[str] = []
+    for idx, line in enumerate(lines, start=1):
+        if ext in (".js", ".mjs", ".cjs", ".ts", ".mts", ".tsx", ".jsx"):
+            for pat in JS_PATTERNS:
+                m = pat.match(line)
+                if m:
+                    sig = line.strip().rstrip("{").strip()
+                    rows.append(f"L{idx} {sig[:100]}")
+                    break
+        elif ext == ".css":
+            m = CSS_PAT.match(line.strip())
+            if m:
+                rows.append(f"L{idx} {m.group(1).strip()}")
+        elif ext in (".html", ".htm"):
+            for m in HTML_PAT.finditer(line):
+                rows.append(f"L{idx} #{m.group(1)}")
+        elif ext == ".md" and line.startswith("#"):
+            rows.append(f"L{idx} {line.strip()[:90]}")
+        if len(rows) >= max_lines:
+            break
+    return rows
+
+
+def main() -> int:
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print("Usage: pi-outline <file> [--max 80]", file=sys.stderr)
+        return 0 if len(sys.argv) >= 2 else 2
+
+    target = pathlib.Path(sys.argv[1])
+    max_lines = 80
+    if "--max" in sys.argv:
+        i = sys.argv.index("--max")
+        if i + 1 < len(sys.argv):
+            max_lines = max(1, int(sys.argv[i + 1]))
+
+    if not target.is_file():
+        print(f"File not found: {target}", file=sys.stderr)
+        return 1
+
+    total = sum(1 for _ in target.open("r", encoding="utf-8", errors="replace"))
+    try:
+        rows = outline_python(target, max_lines) if target.suffix.lower() == ".py" else outline_generic(target, max_lines)
+    except SyntaxError as exc:
+        print(f"{target} ({total} lines) SyntaxError line {exc.lineno}: {exc.msg}")
+        return 1
+
+    print(f"# {target} ({total} lines, {len(rows)} symbols)")
+    for row in rows:
+        print(row)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -7,6 +7,20 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { appendLocalTrace } from "./local-trace.ts";
+
+const THINKING_TIER_LADDER = ["minimal", "low", "medium", "high"] as const;
+
+export function resolveEscalatedThinkingLevel(
+  baseLevel: string | undefined,
+  escalationOffset: number,
+): string | undefined {
+  const clean = String(baseLevel || "").trim().toLowerCase();
+  const idx = THINKING_TIER_LADDER.indexOf(clean as (typeof THINKING_TIER_LADDER)[number]);
+  if (idx === -1) return baseLevel;
+  const nextIdx = Math.min(THINKING_TIER_LADDER.length - 1, Math.max(0, idx + Math.max(0, escalationOffset)));
+  return THINKING_TIER_LADDER[nextIdx];
+}
 
 const STATUS_KEY = "local-omlx-meter";
 const TICK_INTERVAL_MS = 500;
@@ -68,6 +82,8 @@ export function isLocalProviderModel(model: ExtensionContext["model"]): boolean 
   const provider = String(model.provider || "").toLowerCase();
   if (
     provider === "inkling-local" ||
+    provider === "surogate-local" ||
+    provider === "ornith-splash" ||
     provider === "omlx-local" ||
     provider === "omlx" ||
     provider.endsWith("-local")
@@ -79,6 +95,10 @@ export function isLocalProviderModel(model: ExtensionContext["model"]): boolean 
     baseUrl.startsWith("http://127.0.0.1") ||
     baseUrl.startsWith("http://localhost")
   );
+}
+
+export function isSplashProvider(provider: string): boolean {
+  return provider === "surogate-local" || provider === "ornith-splash";
 }
 
 export function resolveSplashThinkingBudget(level: string | undefined): number | undefined {
@@ -112,6 +132,7 @@ export function resolveServerOrigin(model: ExtensionContext["model"]): string | 
   const provider = String(model?.provider || "").toLowerCase();
   if (provider === "inkling-local") return "http://127.0.0.1:18089";
   if (provider === "surogate-local") return "http://127.0.0.1:18091";
+  if (provider === "ornith-splash") return "http://127.0.0.1:18092";
   if (provider === "omlx-local" || provider === "omlx") return "http://127.0.0.1:8000";
   return null;
 }
@@ -364,7 +385,7 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
     if (disposed || statusEndpointUnsupported) return null;
     if (!isLocalProviderModel(ctx.model)) return null;
     const provider = String(ctx.model?.provider || "").toLowerCase();
-    if (provider === "surogate-local") return null;
+    if (provider === "surogate-local" || provider === "ornith-splash") return null;
     const origin = resolveServerOrigin(ctx.model);
     if (!origin) return null;
 
@@ -425,7 +446,12 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
     const nextPayload: Record<string, unknown> = { ...payload };
     let changed = false;
 
-    if (provider === "surogate-local" || provider === "omlx-local" || provider === "omlx") {
+    if (
+      provider === "surogate-local" ||
+      provider === "ornith-splash" ||
+      provider === "omlx-local" ||
+      provider === "omlx"
+    ) {
       if (nextPayload.temperature === undefined) {
         nextPayload.temperature = 0.65;
         changed = true;
@@ -438,9 +464,13 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
         nextPayload.top_k = 20;
         changed = true;
       }
+      if (nextPayload.presence_penalty === undefined) {
+        nextPayload.presence_penalty = 0.0;
+        changed = true;
+      }
     }
 
-    if (provider === "surogate-local") {
+    if (isSplashProvider(provider)) {
       const rawKwargs =
         nextPayload.chat_template_kwargs && typeof nextPayload.chat_template_kwargs === "object"
           ? (nextPayload.chat_template_kwargs as Record<string, unknown>)
@@ -454,11 +484,16 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
           changed = true;
         }
         if (nextPayload.thinking_token_budget === undefined) {
-          const level =
+          const baseLevel =
             typeof (pi as { getThinkingLevel?: () => string }).getThinkingLevel === "function"
               ? (pi as { getThinkingLevel: () => string }).getThinkingLevel()
               : undefined;
-          const budget = resolveSplashThinkingBudget(level);
+          const g = globalThis as typeof globalThis & { __piLocalEscalation?: { offset?: number } };
+          const adaptiveEnabled = process.env.PI_LOCAL_ADAPTIVE_THINK === "1";
+          const effectiveLevel = adaptiveEnabled
+            ? resolveEscalatedThinkingLevel(baseLevel, Number(g.__piLocalEscalation?.offset || 0))
+            : baseLevel;
+          const budget = resolveSplashThinkingBudget(effectiveLevel);
           if (budget !== undefined) {
             nextPayload.thinking_token_budget = budget;
             changed = true;
@@ -613,6 +648,19 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
       serverStats?.prefillTps,
     );
     safeSetStatus(ctx, lastCompletedSummary);
+
+    appendLocalTrace("local-omlx-meter", "turn_end", {
+      provider: ctx.model?.provider,
+      model: ctx.model?.id,
+      turnSec: Number(turnSec.toFixed(2)),
+      ttftSec: ttftSec !== null ? Number(ttftSec.toFixed(2)) : null,
+      genTps: finalTps !== null && Number.isFinite(finalTps) ? Number(finalTps.toFixed(1)) : null,
+      prefillTps: serverStats?.prefillTps ?? null,
+      promptTokens: serverStats?.promptTokens ?? null,
+      cachedTokens: serverStats?.cachedTokens ?? null,
+      outputTokens: outTok,
+      reasoningTokens: serverStats?.reasoningTokens ?? null,
+    });
 
     const completedTurnStamp = now;
     void refreshOmlxStatus(ctx).then((snapshot) => {

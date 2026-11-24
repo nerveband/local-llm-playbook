@@ -33,7 +33,42 @@
           "compat": {
             "thinkingFormat": "openai",
             "supportsReasoningEffort": true,
+            "requiresReasoningContentOnAssistantMessages": true,
             "maxTokensField": "max_tokens"
+          }
+        }
+      ]
+    },
+    "ornith-splash": {
+      "baseUrl": "http://127.0.0.1:18092/v1",
+      "api": "openai-completions",
+      "apiKey": "local-placeholder",
+      "models": [
+        {
+          "id": "ornith",
+          "name": "Ornith 1.5 35B-A3B (Splash DFlash2)",
+          "reasoning": true,
+          "input": [
+            "text"
+          ],
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "contextWindow": 131072,
+          "maxTokens": 32768,
+          "compat": {
+            "thinkingFormat": "qwen-chat-template",
+            "maxTokensField": "max_tokens"
+          },
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high"
           }
         }
       ]
@@ -46,7 +81,7 @@
       "models": [
         {
           "id": "Ornith-1.5-35B-A3B-Abliterated-MLX-4bit",
-          "name": "Ornith 1.5 Abliterated",
+          "name": "Ornith 1.5 Abliterated (oMLX)",
           "reasoning": true,
           "input": [
             "text",
@@ -64,9 +99,10 @@
             "thinkingFormat": "qwen-chat-template"
           },
           "thinkingLevelMap": {
-            "minimal": null,
-            "low": null,
-            "medium": null,
+            "off": null,
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
             "high": "high"
           }
         }

@@ -6,7 +6,9 @@ SCRIPT_DIR="${SCRIPT_PATH:h}"
 REPO_DIR="${SCRIPT_DIR:h}"
 
 INKLING_MODEL="inkling-local/inkling"
-ORNITH_MODEL="omlx-local/Ornith-1.5-35B-A3B-Abliterated-MLX-4bit"
+ORNITH_SPLASH_MODEL="ornith-splash/ornith"
+ORNITH_OMLX_MODEL="omlx-local/Ornith-1.5-35B-A3B-Abliterated-MLX-4bit"
+ORNITH_MODEL="$ORNITH_SPLASH_MODEL"
 SUROGATE_MODEL="surogate-local/surogate"
 
 MODEL="$INKLING_MODEL"
@@ -17,6 +19,14 @@ USE_SUBAGENTS=0
 USE_RULES=1
 USE_PHASE_TOOL=1
 USE_CONTEXT_GUARD=1
+USE_GOAL_GATE=1
+USE_CRITIC=1
+USE_HASHLINE="auto"
+USE_CODEMODE=0
+USE_PREFLIGHT=0
+AUTO_CRITIC=0
+ADAPTIVE_THINK=0
+TRACE_ENABLED=0
 USE_LEGACY_SPEED=0
 NO_AGENTS_MD=0
 PRINT_CMD=0
@@ -35,11 +45,21 @@ model picker and automatically swaps/starts the right local server cleanly withi
 
 Options:
   --inkling        Select Inkling 2 Mini directly on port 18089 (skips picker)
-  --ornith         Select Ornith 1.5 35B-A3B directly on port 8000 (thinking: high)
+  --ornith         Select Ornith 1.5 35B-A3B via ornith-splash on port 18092 (thinking: high)
+  --ornith-omlx    Select Ornith 1.5 35B-A3B via legacy oMLX.app on port 8000 (thinking: high)
   --surogate       Select Surogate 3.7 Flash directly on port 18091 (128K, thinking: high)
   --model <id>     Override provider/model id (skips picker)
   --think <level>  Override thinking level: off, minimal, low, medium, high, xhigh, max
   --no-think       Shortcut for --think off
+  --hashline       Enable pi-hashline-edit read/edit override (auto-enabled for Surogate & Ornith)
+  --no-hashline    Disable pi-hashline-edit even for Surogate & Ornith
+  --codemode       Keep Pi's codemode tool enabled (helpful for Python-first models like Inkling)
+  --preflight      Inject Turn-0 zero-PII workspace/CSV schema snapshot into static prompt
+  --auto-critic    Run one zero-swap fresh-context critic pass before final completion
+  --adaptive-think Step thinking tier up +1 after 2 consecutive errors and down after 2 clean turns
+  --trace          Write per-turn JSONL flight-recorder traces to /tmp/pi-local-traces/
+  --no-goal-gate   Skip local-goal-gate (/goal and .pi-verify.json deliverable verifier)
+  --no-critic      Skip local-critic extension (/critic command)
   --subagents      Load isolated pi-subagents extension for multi-step delegation
   --no-phase-tool  Skip local phase_handoff tool / /next-phase extension
   --no-context-guard Skip local-context-guard output trimmer and failure recovery hints
@@ -47,7 +67,7 @@ Options:
   --no-rules       Do not append prompts/local-lean-rules.md
   --bare           Skip global AGENTS.md / CLAUDE.md context files for minimum tokens
   --no-autostart   Do not automatically stop or start local model servers
-  --stop-all       Stop Inkling (port 18089), Surogate (port 18091), and quit oMLX.app (port 8000)
+  --stop-all       Stop Inkling (18089), Surogate (18091), Ornith (18092), and quit oMLX.app (8000)
   --pick           Force the interactive model picker even with --print-cmd
   --print-cmd      Print the resolved pi command and exit without running servers or pi
   -h, --help       Show this help and exit
@@ -58,7 +78,7 @@ Examples:
   pi-local                    # Open picker, auto-swap/start server, launch Pi
   pi-local --bare             # Open picker with minimal prompt mode
   pi-local --inkling          # Launch Inkling directly without picker
-  pi-local --ornith --no-think
+  pi-local --ornith --preflight --auto-critic
   pi-local --surogate         # Launch Surogate 3.7 Flash (Splash DFlash2)
   pi-local --stop-all         # Free all local GPU RAM
 EOF
@@ -75,7 +95,15 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --ornith)
-      MODEL="$ORNITH_MODEL"
+      MODEL="$ORNITH_SPLASH_MODEL"
+      MODEL_EXPLICIT=1
+      if [[ "$THINK_EXPLICIT" == "0" ]]; then
+        THINK="high"
+      fi
+      shift
+      ;;
+    --ornith-omlx)
+      MODEL="$ORNITH_OMLX_MODEL"
       MODEL_EXPLICIT=1
       if [[ "$THINK_EXPLICIT" == "0" ]]; then
         THINK="high"
@@ -111,6 +139,42 @@ while [[ $# -gt 0 ]]; do
     --no-think)
       THINK="off"
       THINK_EXPLICIT=1
+      shift
+      ;;
+    --hashline)
+      USE_HASHLINE="1"
+      shift
+      ;;
+    --no-hashline)
+      USE_HASHLINE="0"
+      shift
+      ;;
+    --codemode)
+      USE_CODEMODE=1
+      shift
+      ;;
+    --preflight)
+      USE_PREFLIGHT=1
+      shift
+      ;;
+    --auto-critic)
+      AUTO_CRITIC=1
+      shift
+      ;;
+    --adaptive-think)
+      ADAPTIVE_THINK=1
+      shift
+      ;;
+    --trace)
+      TRACE_ENABLED=1
+      shift
+      ;;
+    --no-goal-gate)
+      USE_GOAL_GATE=0
+      shift
+      ;;
+    --no-critic)
+      USE_CRITIC=0
       shift
       ;;
     --subagents)
@@ -235,6 +299,44 @@ start_surogate() {
   "$bin" start >&2
 }
 
+find_ornith_splash_bin() {
+  if command -v ornith-splash >/dev/null 2>&1; then
+    command -v ornith-splash
+    return 0
+  fi
+  if [[ -x "$HOME/.local/bin/ornith-splash" ]]; then
+    print -r -- "$HOME/.local/bin/ornith-splash"
+    return 0
+  fi
+  return 1
+}
+
+ornith_splash_running() {
+  pgrep -f -- "splash-1\.7\.0-m1 serve .*--port 18092" >/dev/null 2>&1
+}
+
+stop_ornith_splash() {
+  local bin=""
+  if bin=$(find_ornith_splash_bin); then
+    "$bin" stop >&2
+    return 0
+  fi
+  if ornith_splash_running; then
+    pkill -TERM -f -- "splash-1\.7\.0-m1 serve .*--port 18092" 2>/dev/null || true
+    sleep 1
+    pkill -KILL -f -- "splash-1\.7\.0-m1 serve .*--port 18092" 2>/dev/null || true
+  fi
+}
+
+start_ornith_splash() {
+  local bin=""
+  bin=$(find_ornith_splash_bin) || {
+    print -u2 "Error: ornith-splash launcher not found in PATH or $HOME/.local/bin/ornith-splash"
+    exit 1
+  }
+  "$bin" start >&2
+}
+
 ornith_app_running() {
   pgrep -f "/Applications/oMLX\.app/Contents/MacOS/oMLX" >/dev/null 2>&1 || pgrep -x "oMLX" >/dev/null 2>&1
 }
@@ -303,11 +405,15 @@ start_ornith() {
 }
 
 INKLING_CODE=$(port_http_code "http://127.0.0.1:18089/v1/models")
+ORNITH_SPLASH_CODE=$(port_http_code "http://127.0.0.1:18092/v1/models")
 ORNITH_CODE=$(port_http_code "http://127.0.0.1:8000/v1/models")
 SUROGATE_CODE=$(port_http_code "http://127.0.0.1:18091/v1/models")
 
 INKLING_UP=0
 [[ "$INKLING_CODE" != "000" ]] && INKLING_UP=1
+
+ORNITH_SPLASH_UP=0
+[[ "$ORNITH_SPLASH_CODE" != "000" ]] && ORNITH_SPLASH_UP=1
 
 ORNITH_UP=0
 [[ "$ORNITH_CODE" != "000" ]] && ORNITH_UP=1
@@ -324,6 +430,10 @@ stop_all_models() {
     print -u2 "Stopping surogate-splash (port 18091)..."
     stop_surogate
   fi
+  if [[ "$ORNITH_SPLASH_UP" == "1" ]] || ornith_splash_running; then
+    print -u2 "Stopping ornith-splash (port 18092)..."
+    stop_ornith_splash
+  fi
   if [[ "$ORNITH_UP" == "1" ]] || ornith_app_running; then
     print -u2 "Stopping oMLX desktop app (port 8000)..."
     stop_ornith
@@ -334,7 +444,7 @@ stop_all_models() {
 
 if [[ "$STOP_ALL" == "1" ]]; then
   if [[ "$PRINT_CMD" == "1" ]]; then
-    print -r -- "stop-all: would stop inkling-omlx, surogate-splash, and quit oMLX.app"
+    print -r -- "stop-all: would stop inkling-omlx, surogate-splash, ornith-splash, and quit oMLX.app"
     exit 0
   fi
   stop_all_models
@@ -345,23 +455,24 @@ if [[ "$FORCE_PICK" == "1" ]] || { [[ "$MODEL_EXPLICIT" == "0" && "$PRINT_CMD" =
   [[ "$INKLING_UP" == "1" ]] && INKLING_STATUS="running"
 
   ORNITH_STATUS="stopped"
-  [[ "$ORNITH_UP" == "1" ]] && ORNITH_STATUS="running"
+  [[ "$ORNITH_SPLASH_UP" == "1" ]] && ORNITH_STATUS="running (splash)"
+  [[ "$ORNITH_UP" == "1" && "$ORNITH_SPLASH_UP" == "0" ]] && ORNITH_STATUS="running (oMLX.app)"
 
   SUROGATE_STATUS="stopped"
   [[ "$SUROGATE_UP" == "1" ]] && SUROGATE_STATUS="running"
 
   DEFAULT_CHOICE="1"
-  if [[ "$SUROGATE_UP" == "1" && "$INKLING_UP" == "0" && "$ORNITH_UP" == "0" ]]; then
+  if [[ "$SUROGATE_UP" == "1" && "$INKLING_UP" == "0" && "$ORNITH_SPLASH_UP" == "0" && "$ORNITH_UP" == "0" ]]; then
     DEFAULT_CHOICE="3"
-  elif [[ "$ORNITH_UP" == "1" && "$INKLING_UP" == "0" && "$SUROGATE_UP" == "0" ]]; then
+  elif [[ ( "$ORNITH_SPLASH_UP" == "1" || "$ORNITH_UP" == "1" ) && "$INKLING_UP" == "0" && "$SUROGATE_UP" == "0" ]]; then
     DEFAULT_CHOICE="2"
   fi
 
   print -u2 ""
   print -u2 "pi-local: choose local model"
-  print -u2 "  1) Inkling 2 Mini (128K, port 18089)   [$INKLING_STATUS]"
-  print -u2 "  2) Ornith 1.5 35B-A3B (port 8000)      [$ORNITH_STATUS]"
-  print -u2 "  3) Surogate 3.7 Flash (128K, port 18091) [$SUROGATE_STATUS]"
+  print -u2 "  1) Inkling 2 Mini (128K, port 18089)        [$INKLING_STATUS]"
+  print -u2 "  2) Ornith 1.5 35B-A3B (128K, port 18092)   [$ORNITH_STATUS]"
+  print -u2 "  3) Surogate 3.7 Flash (128K, port 18091)   [$SUROGATE_STATUS]"
   print -u2 "  4) Stop all local models and exit"
   printf "Select [1-4] (default %s): " "$DEFAULT_CHOICE" >&2
 
@@ -377,7 +488,7 @@ if [[ "$FORCE_PICK" == "1" ]] || { [[ "$MODEL_EXPLICIT" == "0" && "$PRINT_CMD" =
       fi
       ;;
     2)
-      MODEL="$ORNITH_MODEL"
+      MODEL="$ORNITH_SPLASH_MODEL"
       if [[ "$THINK_EXPLICIT" == "0" ]]; then
         THINK="high"
       fi
@@ -390,7 +501,7 @@ if [[ "$FORCE_PICK" == "1" ]] || { [[ "$MODEL_EXPLICIT" == "0" && "$PRINT_CMD" =
       ;;
     4)
       if [[ "$PRINT_CMD" == "1" ]]; then
-        print -r -- "stop-all: would stop inkling-omlx, surogate-splash, and quit oMLX.app"
+        print -r -- "stop-all: would stop inkling-omlx, surogate-splash, ornith-splash, and quit oMLX.app"
         exit 0
       fi
       stop_all_models
@@ -410,6 +521,9 @@ if [[ "$PRINT_CMD" == "1" || "$NO_AUTOSTART" == "1" ]]; then
     if [[ "$ORNITH_UP" != "0" ]]; then
       print -u2 "Note: oMLX desktop port 8000 is also listening. Unload Ornith before heavy Inkling sessions to protect browser RAM."
     fi
+    if [[ "$ORNITH_SPLASH_UP" != "0" ]] || ornith_splash_running; then
+      print -u2 "Warning: ornith-splash is also running on port 18092. Run 'ornith-splash stop' so both models do not compete for 64 GiB RAM."
+    fi
     if [[ "$SUROGATE_UP" != "0" ]] || surogate_splash_running; then
       print -u2 "Warning: surogate-splash is also running on port 18091. Run 'surogate-splash stop' so both models do not compete for 64 GiB RAM."
     fi
@@ -420,8 +534,24 @@ if [[ "$PRINT_CMD" == "1" || "$NO_AUTOSTART" == "1" ]]; then
     if [[ "$INKLING_UP" != "0" ]]; then
       print -u2 "Warning: inkling-omlx is also running on port 18089. Run 'inkling-omlx stop' before using Surogate so both models do not compete for 64 GiB RAM."
     fi
+    if [[ "$ORNITH_SPLASH_UP" != "0" ]] || ornith_splash_running; then
+      print -u2 "Warning: ornith-splash is also running on port 18092. Run 'ornith-splash stop' before using Surogate so both models do not compete for 64 GiB RAM."
+    fi
     if [[ "$ORNITH_UP" != "0" ]] || ornith_app_running; then
       print -u2 "Warning: oMLX desktop port 8000 is also listening. Quit oMLX.app before using Surogate so both models do not compete for 64 GiB RAM."
+    fi
+  elif [[ "$MODEL" == ornith-splash/* ]]; then
+    if [[ "$ORNITH_SPLASH_UP" == "0" ]]; then
+      print -u2 "Warning: ornith-splash is not reachable on http://127.0.0.1:18092 (start it with: ornith-splash start)"
+    fi
+    if [[ "$INKLING_UP" != "0" ]]; then
+      print -u2 "Warning: inkling-omlx is also running on port 18089. Run 'inkling-omlx stop' before using Ornith so both models do not compete for 64 GiB RAM."
+    fi
+    if [[ "$SUROGATE_UP" != "0" ]] || surogate_splash_running; then
+      print -u2 "Warning: surogate-splash is also running on port 18091. Run 'surogate-splash stop' before using Ornith so both models do not compete for 64 GiB RAM."
+    fi
+    if [[ "$ORNITH_UP" != "0" ]] || ornith_app_running; then
+      print -u2 "Warning: oMLX desktop port 8000 is also listening. Quit oMLX.app before using ornith-splash so both models do not compete for 64 GiB RAM."
     fi
   elif [[ "$MODEL" == omlx-local/* || "$MODEL" == omlx/* ]]; then
     if [[ "$ORNITH_UP" == "0" ]]; then
@@ -433,12 +563,19 @@ if [[ "$PRINT_CMD" == "1" || "$NO_AUTOSTART" == "1" ]]; then
     if [[ "$SUROGATE_UP" != "0" ]] || surogate_splash_running; then
       print -u2 "Warning: surogate-splash is also running on port 18091. Run 'surogate-splash stop' before using Ornith so both models do not compete for 64 GiB RAM."
     fi
+    if [[ "$ORNITH_SPLASH_UP" != "0" ]] || ornith_splash_running; then
+      print -u2 "Warning: ornith-splash is also running on port 18092. Run 'ornith-splash stop' before using oMLX.app so both models do not compete for 64 GiB RAM."
+    fi
   fi
 else
   if [[ "$MODEL" == inkling-local/* ]]; then
     if [[ "$ORNITH_UP" == "1" ]] || ornith_app_running; then
       print -u2 "Stopping oMLX desktop app (Ornith) to free RAM for Inkling..."
       stop_ornith
+    fi
+    if [[ "$ORNITH_SPLASH_UP" == "1" ]] || ornith_splash_running; then
+      print -u2 "Stopping ornith-splash to free RAM for Inkling..."
+      stop_ornith_splash
     fi
     if [[ "$SUROGATE_UP" == "1" ]] || surogate_splash_running; then
       print -u2 "Stopping surogate-splash to free RAM for Inkling..."
@@ -453,13 +590,34 @@ else
       print -u2 "Stopping inkling-omlx to free RAM for Surogate..."
       stop_inkling
     fi
+    if [[ "$ORNITH_SPLASH_UP" == "1" ]] || ornith_splash_running; then
+      print -u2 "Stopping ornith-splash to free RAM for Surogate..."
+      stop_ornith_splash
+    fi
     if [[ "$ORNITH_UP" == "1" ]] || ornith_app_running; then
       print -u2 "Stopping oMLX desktop app (Ornith) to free RAM for Surogate..."
       stop_ornith
     fi
     if [[ "$SUROGATE_UP" == "0" ]]; then
-      print -u2 "Starting surogate-splash (128K + bf16 KV/state + thinking cap)..."
+      print -u2 "Starting surogate-splash (128K + DFlash2 + thinking cap)..."
       start_surogate
+    fi
+  elif [[ "$MODEL" == ornith-splash/* ]]; then
+    if [[ "$INKLING_UP" == "1" ]]; then
+      print -u2 "Stopping inkling-omlx to free RAM for Ornith..."
+      stop_inkling
+    fi
+    if [[ "$SUROGATE_UP" == "1" ]] || surogate_splash_running; then
+      print -u2 "Stopping surogate-splash to free RAM for Ornith..."
+      stop_surogate
+    fi
+    if [[ "$ORNITH_UP" == "1" ]] || ornith_app_running; then
+      print -u2 "Stopping oMLX desktop app to free RAM for ornith-splash..."
+      stop_ornith
+    fi
+    if [[ "$ORNITH_SPLASH_UP" == "0" ]]; then
+      print -u2 "Starting ornith-splash (128K + resident experts + native DFlash2 + thinking cap)..."
+      start_ornith_splash
     fi
   elif [[ "$MODEL" == omlx-local/* || "$MODEL" == omlx/* ]]; then
     if [[ "$INKLING_UP" == "1" ]]; then
@@ -469,6 +627,10 @@ else
     if [[ "$SUROGATE_UP" == "1" ]] || surogate_splash_running; then
       print -u2 "Stopping surogate-splash to free RAM for Ornith..."
       stop_surogate
+    fi
+    if [[ "$ORNITH_SPLASH_UP" == "1" ]] || ornith_splash_running; then
+      print -u2 "Stopping ornith-splash to free RAM for oMLX desktop app..."
+      stop_ornith_splash
     fi
     if [[ "$ORNITH_UP" == "0" ]]; then
       print -u2 "Starting oMLX desktop app for Ornith on port 8000..."
@@ -482,8 +644,10 @@ ARGS=(
   --no-mcp
   --no-skills
   --no-extensions
-  --exclude-tools codemode
 )
+if [[ "$USE_CODEMODE" != "1" ]]; then
+  ARGS+=(--exclude-tools codemode)
+fi
 
 if [[ "$NO_AGENTS_MD" == "1" ]]; then
   ARGS+=(--no-context-files)
@@ -491,6 +655,26 @@ fi
 
 if [[ "$USE_RULES" == "1" && -f "$REPO_DIR/prompts/local-lean-rules.md" ]]; then
   ARGS+=(--append-system-prompt "$REPO_DIR/prompts/local-lean-rules.md")
+fi
+
+PREFLIGHT_TMP=""
+cleanup_preflight() {
+  if [[ -n "$PREFLIGHT_TMP" && -f "$PREFLIGHT_TMP" ]]; then
+    rm -f "$PREFLIGHT_TMP" 2>/dev/null || true
+  fi
+}
+trap cleanup_preflight EXIT INT TERM
+
+if [[ "$USE_PREFLIGHT" == "1" ]] && [[ -x "$REPO_DIR/bin/pi-preflight" ]]; then
+  if [[ "$PRINT_CMD" == "1" ]]; then
+    ARGS+=(--append-system-prompt "<workspace_preflight_tmp>")
+  else
+    PREFLIGHT_TMP=$(mktemp -t pi-preflight.XXXXXX)
+    "$REPO_DIR/bin/pi-preflight" "$PWD" >"$PREFLIGHT_TMP" 2>/dev/null || true
+    if [[ -s "$PREFLIGHT_TMP" ]]; then
+      ARGS+=(--append-system-prompt "$PREFLIGHT_TMP")
+    fi
+  fi
 fi
 
 LOCAL_EXT_ROOT="$HOME/.local/share/pi-local-extensions/node_modules"
@@ -503,11 +687,27 @@ add_ext() {
   fi
 }
 
+HASHLINE_ACTIVE=0
+if [[ "$USE_HASHLINE" == "1" ]]; then
+  HASHLINE_ACTIVE=1
+elif [[ "$USE_HASHLINE" == "auto" ]] && [[ "$MODEL" == surogate-local/* || "$MODEL" == ornith-splash/* || "$MODEL" == omlx-local/* ]]; then
+  HASHLINE_ACTIVE=1
+fi
+if [[ "$HASHLINE_ACTIVE" == "1" ]]; then
+  add_ext "$LOCAL_EXT_ROOT/pi-hashline-edit/index.ts"
+fi
+
 if [[ "$USE_PHASE_TOOL" == "1" ]]; then
   add_ext "$REPO_DIR/extensions/local-phase-handoff.ts"
 fi
 if [[ "$USE_CONTEXT_GUARD" == "1" ]]; then
   add_ext "$REPO_DIR/extensions/local-context-guard.ts"
+fi
+if [[ "$USE_GOAL_GATE" == "1" ]]; then
+  add_ext "$REPO_DIR/extensions/local-goal-gate.ts"
+fi
+if [[ "$USE_CRITIC" == "1" ]]; then
+  add_ext "$REPO_DIR/extensions/local-critic.ts"
 fi
 
 add_ext "$LOCAL_EXT_ROOT/pi-handoff/extensions/handoff.ts"
@@ -523,9 +723,23 @@ fi
 add_ext "$GLOBAL_EXT_ROOT/@erichll/pi-statusline/src/index.ts"
 add_ext "$GLOBAL_EXT_ROOT/pi-tool-repair/tool-repair.ts"
 
+if [[ "$AUTO_CRITIC" == "1" ]]; then
+  export PI_LOCAL_AUTO_CRITIC=1
+fi
+if [[ "$ADAPTIVE_THINK" == "1" ]]; then
+  export PI_LOCAL_ADAPTIVE_THINK=1
+fi
+if [[ "$TRACE_ENABLED" == "1" ]]; then
+  export PI_LOCAL_TRACE=1
+fi
+
 if [[ "$PRINT_CMD" == "1" ]]; then
   print -r -- "pi ${(q-)ARGS[@]} ${(q-)@}"
   exit 0
 fi
 
+if [[ -n "$PREFLIGHT_TMP" ]]; then
+  pi "${ARGS[@]}" "$@"
+  exit $?
+fi
 exec pi "${ARGS[@]}" "$@"

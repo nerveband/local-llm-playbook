@@ -1,0 +1,173 @@
+#!/bin/zsh
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: pi-verify-ui <html-file-or-url> [options]
+
+Single-shot headless Chromium DOM, console/pageerror, layout, and optional custom JS audit
+using agent-browser with guaranteed session cleanup.
+
+Options:
+  --eval-js <file>       JS expression or file whose expression returns {ok, detail} or truthy
+  --expect-min-text <n>  Minimum visible body innerText length (default: 40)
+  --screenshot <path>    Save screenshot to <path>
+  --session <name>       Override AGENT_BROWSER_SESSION name
+  -h, --help             Show help
+EOF
+}
+
+if [[ $# -eq 0 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+TARGET="$1"
+shift
+EVAL_JS=""
+MIN_TEXT=40
+SCREENSHOT=""
+SESSION="pi-ui-$$-$RANDOM"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --eval-js) EVAL_JS="${2:-}"; shift 2 ;;
+    --expect-min-text) MIN_TEXT="${2:-40}"; shift 2 ;;
+    --screenshot) SCREENSHOT="${2:-}"; shift 2 ;;
+    --session) SESSION="${2:-$SESSION}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) print -u2 "Unknown option: $1"; exit 2 ;;
+  esac
+done
+
+URL="$TARGET"
+if [[ "$TARGET" != http://* && "$TARGET" != https://* && "$TARGET" != file://* ]]; then
+  ABS_PATH=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$TARGET")
+  if [[ ! -e "$ABS_PATH" ]]; then
+    print -r -- "{\"ok\":false,\"error\":\"Target file not found: $ABS_PATH\"}"
+    exit 1
+  fi
+  URL="file://$ABS_PATH"
+fi
+
+if ! command -v agent-browser >/dev/null 2>&1; then
+  print -r -- '{"ok":false,"error":"agent-browser binary not found in PATH"}'
+  exit 1
+fi
+
+export AGENT_BROWSER_SESSION="$SESSION"
+cleanup() {
+  agent-browser close >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+CUSTOM_EXPR="null"
+if [[ -n "$EVAL_JS" ]]; then
+  if [[ -f "$EVAL_JS" ]]; then
+    CUSTOM_EXPR=$(cat "$EVAL_JS")
+  else
+    CUSTOM_EXPR="$EVAL_JS"
+  fi
+fi
+
+agent-browser open "$URL" >/dev/null
+agent-browser wait --load networkidle >/dev/null 2>&1 || sleep 0.5
+
+CONSOLE_RAW=$(agent-browser console --json 2>/dev/null || print -r -- "[]")
+ERRORS_RAW=$(agent-browser errors --json 2>/dev/null || print -r -- "[]")
+
+DOM_JS=$(python3 - "$MIN_TEXT" "$CUSTOM_EXPR" <<'PY'
+import json, sys
+min_text = int(sys.argv[1])
+custom_expr = sys.argv[2]
+print(f"""(() => {{
+  const textLen = (document.body?.innerText || "").trim().length;
+  const tables = document.querySelectorAll("table").length;
+  const rows = document.querySelectorAll("tr").length;
+  const buttons = document.querySelectorAll("button").length;
+  const inputs = document.querySelectorAll("input,select,textarea").length;
+  const headings = document.querySelectorAll("h1,h2,h3").length;
+  let zeroSizeInteractive = 0;
+  for (const el of document.querySelectorAll("button,input,select")) {{
+    const st = getComputedStyle(el);
+    if (st.display === "none" || st.visibility === "hidden") continue;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) zeroSizeInteractive++;
+  }}
+  let custom = {custom_expr};
+  return {{
+    title: document.title || "",
+    url: location.href,
+    bodyTextLen: textLen,
+    minTextPass: textLen >= {min_text},
+    counts: {{ tables, rows, buttons, inputs, headings }},
+    zeroSizeInteractive,
+    custom
+  }};
+}})()""")
+PY
+)
+
+DOM_RAW=$(agent-browser eval --json "$DOM_JS" 2>/dev/null || print -r -- '{"success":false}')
+
+if [[ -n "$SCREENSHOT" ]]; then
+  agent-browser screenshot "$SCREENSHOT" >/dev/null 2>&1 || true
+fi
+
+python3 - "$CONSOLE_RAW" "$ERRORS_RAW" "$DOM_RAW" "$MIN_TEXT" "$SCREENSHOT" <<'PY'
+import json, sys
+
+def parse(raw):
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw
+
+con_data = parse(sys.argv[1])
+err_data = parse(sys.argv[2])
+dom_wrap = parse(sys.argv[3])
+min_text = int(sys.argv[4])
+shot = sys.argv[5]
+
+con_items = con_data.get("data", {}).get("messages", []) if isinstance(con_data, dict) else []
+console_errors = [m for m in con_items if isinstance(m, dict) and str(m.get("type", "")).lower() in ("error", "assert")]
+
+err_items = []
+if isinstance(err_data, dict):
+    d = err_data.get("data", {})
+    err_items = d.get("errors", []) if isinstance(d, dict) else []
+
+dom = dom_wrap.get("data", {}).get("result", dom_wrap) if isinstance(dom_wrap, dict) else {}
+if not isinstance(dom, dict):
+    dom = {}
+
+custom = dom.get("custom")
+custom_ok = True
+if custom is False or (isinstance(custom, dict) and custom.get("ok") is False):
+    custom_ok = False
+
+ok = (
+    bool(dom.get("minTextPass"))
+    and len(console_errors) == 0
+    and len(err_items) == 0
+    and custom_ok
+)
+
+out = {
+    "ok": ok,
+    "title": dom.get("title", ""),
+    "bodyTextLen": dom.get("bodyTextLen", 0),
+    "minTextRequired": min_text,
+    "counts": dom.get("counts", {}),
+    "zeroSizeInteractive": dom.get("zeroSizeInteractive", 0),
+    "consoleErrorCount": len(console_errors),
+    "pageErrorCount": len(err_items),
+    "consoleErrors": [m.get("text", str(m))[:160] for m in console_errors[:5]],
+    "pageErrors": [str(e)[:160] for e in err_items[:5]],
+    "custom": custom,
+}
+if shot:
+    out["screenshot"] = shot
+print(json.dumps(out))
+sys.exit(0 if ok else 1)
+PY

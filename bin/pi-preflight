@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Zero-PII Turn-0 workspace preflight snapshot (tree depth 2, CSV headers + counts only, scripts, git status)."""
+from __future__ import annotations
+
+import csv
+import json
+import pathlib
+import subprocess
+import sys
+
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".next", "dist", "build"}
+
+
+def count_csv_rows(path: pathlib.Path) -> tuple[list[str], int]:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, [])
+            rows = sum(1 for _ in reader)
+            return [c.strip() for c in header], rows
+    except Exception:
+        return [], 0
+
+
+def main() -> int:
+    cwd = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else ".").resolve()
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("Usage: pi-preflight [workspace_dir]", file=sys.stderr)
+        return 0
+
+    lines: list[str] = ["<workspace_snapshot>", f"cwd: {cwd}"]
+
+    # Depth-2 compact file tree + locate CSVs
+    tree_entries: list[str] = []
+    csv_files: list[pathlib.Path] = []
+    for p in sorted(cwd.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+        if p.name.startswith(".") and p.name not in (".pi-verify.json",):
+            continue
+        if p.name in SKIP_DIRS:
+            continue
+        if p.is_dir():
+            tree_entries.append(f"- {p.name}/")
+            try:
+                children = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+                for ch in children[:25]:
+                    if ch.name.startswith(".") or ch.name in SKIP_DIRS:
+                        continue
+                    tree_entries.append(f"  - {ch.name}{'/' if ch.is_dir() else ''}")
+                    if ch.is_file() and ch.suffix.lower() == ".csv":
+                        csv_files.append(ch)
+                if len(children) > 25:
+                    tree_entries.append(f"  - ... ({len(children) - 25} more)")
+            except PermissionError:
+                pass
+        else:
+            size_kb = p.stat().st_size / 1024.0
+            tree_entries.append(f"- {p.name} ({size_kb:.1f} KB)")
+            if p.suffix.lower() == ".csv":
+                csv_files.append(p)
+
+    if tree_entries:
+        lines.append("files:")
+        lines.extend(tree_entries[:60])
+
+    # CSV schemas (headers + row count ONLY — zero row values for privacy)
+    if csv_files:
+        lines.append("csv_schemas (headers + row counts only):")
+        for csv_path in csv_files[:10]:
+            rel = csv_path.relative_to(cwd)
+            cols, count = count_csv_rows(csv_path)
+            lines.append(f"- {rel}: {count} rows, {len(cols)} cols -> {json.dumps(cols)}")
+
+    pkg = cwd / "package.json"
+    if pkg.is_file():
+        try:
+            data = json.loads(pkg.read_text(encoding="utf-8", errors="ignore"))
+            scripts = data.get("scripts")
+            if isinstance(scripts, dict) and scripts:
+                lines.append(f"package_scripts: {', '.join(sorted(scripts.keys())[:15])}")
+        except Exception:
+            pass
+
+    if (cwd / ".git").exists():
+        st = subprocess.run(["git", "status", "--short"], cwd=str(cwd), capture_output=True, text=True)
+        if st.returncode == 0 and st.stdout.strip():
+            status_lines = st.stdout.strip().splitlines()[:15]
+            lines.append("git_status:")
+            lines.extend(f"  {ln}" for ln in status_lines)
+
+    lines.append("</workspace_snapshot>")
+    print("\n".join(lines))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
