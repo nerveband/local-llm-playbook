@@ -369,6 +369,43 @@ test("repairEditArguments handles missing closing bracket, single-quoted Python 
     assert.equal(repairEditArguments(replaceText, dir), true);
     assert.equal(replaceText.edits[0].oldText, "    x = 1\n    return x");
     assert.equal(replaceText.edits[0].newText, "    x = 2\n    return x");
+
+    // 5. Real ornith-opt-r4 malformed stringified edits: raw inner quotes, missing \ before ", stray ], stray ), invalid \, escape
+    const innerQuotes = {
+      path: "sample.py",
+      edits: '[{"op": "replace", "pos": "2#ab", "lines": ["      try { localStorage.setItem(GUIDE_KEY, "1"); } catch {}"]}]',
+    };
+    assert.equal(repairEditArguments(innerQuotes, dir), true);
+    assert.equal(innerQuotes.edits[0].lines[0], '      try { localStorage.setItem(GUIDE_KEY, "1"); } catch {}');
+
+    const droppedSlash = {
+      path: "sample.py",
+      edits: '[{"op": "replace", "pos": "2#ab", "lines": ["    report_groups.sort(key=lambda g: (-g[\\\\"score\\\\"], g[\\\\"group_id"]))"]}]',
+    };
+    assert.equal(repairEditArguments(droppedSlash, dir), true);
+    assert.equal(droppedSlash.edits[0].lines[0], '    report_groups.sort(key=lambda g: (-g["score"], g["group_id"]))');
+
+    const strayBracketBeforeEnd = {
+      path: "sample.py",
+      edits: '[{"op": "replace", "pos": "1#XM", "lines": ["line 1", "line 2"]], "end": "7#VT"}]',
+    };
+    assert.equal(repairEditArguments(strayBracketBeforeEnd, dir), true);
+    assert.equal(strayBracketBeforeEnd.edits[0].end, "7#VT");
+    assert.deepEqual(strayBracketBeforeEnd.edits[0].lines, ["line 1", "line 2"]);
+
+    const trailingParen = {
+      path: "sample.py",
+      edits: '[{"op": "replace", "pos": "2#ab", "lines": ["heading line\\n", "footer line\\n", "#WX:"]])',
+    };
+    assert.equal(repairEditArguments(trailingParen, dir), true);
+    assert.equal(trailingParen.edits[0].lines.length, 3);
+
+    const invalidCommaEscape = {
+      path: "sample.py",
+      edits: '[{"op": "replace", "pos": "2#ab", "lines": ["        \\"is_organization\\": r[\\\\"_isorg\\,"]}]',
+    };
+    assert.equal(repairEditArguments(invalidCommaEscape, dir), true);
+    assert.ok(invalidCommaEscape.edits[0].lines[0].includes('"_isorg'));
   });
 });
 

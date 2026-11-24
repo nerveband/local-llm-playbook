@@ -395,6 +395,137 @@ function normalizeDoubleEscapedJsonQuotes(src: string): string {
     .replace(/\\"(?=[^\s,}\]:])/g, '\\"');
 }
 
+function nextNonWsIndex(src: string, start: number): number {
+  let k = start;
+  while (k < src.length && /\s/.test(src[k])) k += 1;
+  return k;
+}
+
+/** Repair JSON strings containing unescaped inner quotes, invalid escapes, or stray closing brackets/parens. */
+function repairMalformedJsonString(src: string): string {
+  const stack: string[] = [];
+  let inStr = false;
+  let esc = false;
+  let out = "";
+
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+    if (inStr) {
+      if (esc) {
+        esc = false;
+        if (ch === "'") {
+          out += "'";
+        } else if ('"\\/bfnrtu'.includes(ch)) {
+          out += "\\" + ch;
+        } else {
+          out += "\\\\" + ch;
+        }
+        continue;
+      }
+      if (ch === "\\") {
+        esc = true;
+        continue;
+      }
+      if (ch === "\n") {
+        out += "\\n";
+        continue;
+      }
+      if (ch === "\r") {
+        out += "\\r";
+        continue;
+      }
+      if (ch === "\t") {
+        out += "\\t";
+        continue;
+      }
+      if (ch === '"') {
+        const top = stack[stack.length - 1] ?? "";
+        const j = nextNonWsIndex(src, i + 1);
+        const nextChar = j < src.length ? src[j] : "";
+        let isClosing = j >= src.length || (nextChar === ":" && top === "}");
+        if (!isClosing && nextChar === "}" && top === "}") {
+          const after = src.slice(nextNonWsIndex(src, j + 1));
+          isClosing = after.length === 0 || /^[,}\]]/.test(after);
+        } else if (!isClosing && nextChar === "]" && top === "]") {
+          const afterIdx = nextNonWsIndex(src, j + 1);
+          const parentTop = stack.length >= 2 ? stack[stack.length - 2] : "";
+          if (afterIdx >= src.length) {
+            isClosing = true;
+          } else {
+            const after = src.slice(afterIdx);
+            if (parentTop === "}") {
+              isClosing = /^[,}\]]/.test(after) || after.startsWith('"');
+            } else {
+              isClosing = /^[,}\]]/.test(after);
+            }
+          }
+        } else if (!isClosing && nextChar === ",") {
+          const rest = src.slice(j + 1);
+          if (top === "}") {
+            isClosing = /^\s*"[A-Za-z0-9_$-]+"\s*:/.test(rest);
+          } else if (top === "]") {
+            isClosing = /^\s*(?:\{|\[|"(?:[^"\\]|\\.)*"\s*(?:,|\]|\})|-?\d+(?:\.\d+)?\s*(?:,|\]|\})|true|false|null|\])/.test(
+              rest,
+            );
+          }
+        }
+        if (isClosing) {
+          inStr = false;
+          out += '"';
+        } else {
+          out += '\\"';
+        }
+        continue;
+      }
+      out += ch;
+      continue;
+    }
+
+    if (ch === '"') {
+      inStr = true;
+      out += '"';
+    } else if (ch === "[") {
+      stack.push("]");
+      out += "[";
+    } else if (ch === "{") {
+      stack.push("}");
+      out += "{";
+    } else if (ch === "]") {
+      if (stack[stack.length - 1] === "]") {
+        stack.pop();
+        out += "]";
+      }
+      // Drop stray ']' when top expects '}' (e.g. ..."]], "end": ...).
+    } else if (ch === "}") {
+      if (stack[stack.length - 1] === "}" && stack.length > 0) {
+        stack.pop();
+        out += "}";
+      } else if (stack[stack.length - 1] === "]") {
+        stack.pop();
+        out += "]";
+        if (stack[stack.length - 1] === "}") {
+          stack.pop();
+          out += "}";
+        }
+      }
+    } else if (ch === ")" && stack.length > 0 && /^\s*\)*\s*$/.test(src.slice(i))) {
+      // Drop stray trailing ')' at EOF before closing open containers.
+      continue;
+    } else {
+      out += ch;
+    }
+  }
+
+  if (inStr) {
+    out += '"';
+  }
+  out = out.replace(/,\s*([}\]])/g, "$1").replace(/,\s*$/, "");
+  if (stack.length > 0) {
+    out += stack.reverse().join("");
+  }
+  return out;
+}
+
 function tryParseJsonObjectOrArray(raw: string): unknown {
   let cleaned = raw.trim();
   if (!cleaned) return null;
@@ -412,6 +543,7 @@ function tryParseJsonObjectOrArray(raw: string): unknown {
   }
 
   const attempts: string[] = [];
+  const repairAttempts: string[] = [];
   for (const base of baseCandidates) {
     attempts.push(base);
     attempts.push(closeUnbalancedJsonContainers(base));
@@ -422,8 +554,11 @@ function tryParseJsonObjectOrArray(raw: string): unknown {
       attempts.push(unescaped);
       attempts.push(closeUnbalancedJsonContainers(unescaped));
       attempts.push(normalizeRelaxedJsonString(unescaped));
+      repairAttempts.push(repairMalformedJsonString(unescaped));
     }
+    repairAttempts.push(repairMalformedJsonString(base));
   }
+  attempts.push(...repairAttempts);
 
   const seen = new Set<string>();
   for (const candidate of attempts) {
