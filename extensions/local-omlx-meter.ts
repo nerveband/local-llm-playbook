@@ -1,7 +1,6 @@
 import type {
   AssistantMessage,
   AssistantMessageEvent,
-  AssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,

@@ -694,7 +694,11 @@ export function lintFileIssues(filePath: string, cwd: string): FileLintResult {
         syntaxError = nodeCheck.raw.length > 600 ? `${nodeCheck.raw.slice(0, 600)}...` : nodeCheck.raw;
       }
     }
-    const oxlintRes = runToolLines("oxlint", ["--quiet", "-D", "no-undef", "-D", "no-unused-vars", absPath], cwd);
+    const oxlintCfg = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "configs", "oxlintrc-local.json");
+    const oxlintArgs = fs.existsSync(oxlintCfg)
+      ? ["--quiet", "-c", oxlintCfg, absPath]
+      : ["--quiet", "-D", "no-undef", "-D", "no-unused-vars", absPath];
+    const oxlintRes = runToolLines("oxlint", oxlintArgs, cwd);
     if (!oxlintRes.ok) {
       for (const line of oxlintRes.lines) {
         if (/^(?:×|!|x\s|error\b|\d+:\d+)/i.test(line) || line.includes(path.basename(absPath))) {
