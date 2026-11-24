@@ -40,7 +40,7 @@ Both Inkling 2 Mini (looped 24-layer MoE transformer) and dense/thinking coding 
 - **Keep `--slots 1`:** Doubling slots splits memory bandwidth and allocates extra concurrent KV state, slowing single-user interactive speed.
 - **Surogate 3.7 Flash (`128K`, `bf16` KV/state, **Splash** + DFlash2 on port `18091`):**
   - Fine-tuned on **Qwen3.5-35B-A3B-Base** (35B total / 3B active MoE family shared with Qwen3.6-35B-A3B).
-  - Recommended coding-agent settings injected automatically for `surogate-local` by `local-omlx-meter.ts` when unset: `temperature: 0.65`, `top_p: 0.95`, `top_k: 20`, plus `preserve_thinking: true` whenever `enable_thinking` is true so multi-turn agent reasoning carries across turns without losing context, paired with `--thinking-token-budget 2048` in **Splash** and **Rule 8 (Action bias)** in `prompts/local-lean-rules.md`.
+  - Recommended coding-agent settings injected automatically for `surogate-local` by `local-omlx-meter.ts` when unset: `temperature: 0.65`, `top_p: 0.95`, `top_k: 20`, `preserve_thinking: true`, plus per-request `thinking_token_budget` scaled to Pi thinking levels (`minimal: 512`, `low: 1024`, `medium: 1536`, `high: 2048`, `xhigh/max: 4096`) paired with `--thinking-token-budget 2048` in **Splash** and **Rule 8 (Action bias)** in `prompts/local-lean-rules.md`. Keeping `high` (`2048` cap) for Phase 1 analysis and stepping down to `low` (`1024` cap) via `phase_handoff` for Phase 2 UI/script execution cuts thinking overhead without disabling reasoning on a `3B`-active MoE.
 
 ---
 
@@ -117,3 +117,20 @@ Hybrid architectures using sliding-window attention and recurrent GDN layers req
 2. **Never dump raw CSVs or giant JSON blobs into stdout.** Write scripts that inspect schema + row counts + `3` to `5` sample rows, compute distributions in Python, and write full outputs to disk (`results.json`, `review.html`). Cap printed summaries under `20` lines.
 3. **Write concise scripts and modular `.css`/`.html`/`.js` assets with `write`/`edit`.** Never embed large HTML/CSS/JS bundles inside one Python string, and avoid bash heredocs (`<<EOF`). Split UI outputs into separate template files (`<= 300` lines each) plus a tiny builder script so every `write` stays well under output limits.
 4. **Reset sessions around `32K` tokens.** Use `--think low` (`Shift+Tab`) when executing pre-written UI or script specs (`~50%` faster turns and zero thinking bloat), and let `phase_handoff` + `/next-phase` carry `next_thinking_level` across fresh sessions.
+
+---
+
+## 8. Auto-Repairs, Syntax Hooks, and Real Browser Verification
+
+An audit of `25` local Pi sessions (`734` tool calls, `66` errors) showed most recoverable local-model slowdowns come from repeated classes: runtime/script errors (`16`), local guard blocks (`12`), custom DOM stub test failures (`8`), `edit` `oldText` whitespace/escaping mismatches (`6`), Python/JS syntax errors caught late (`5`), missing GNU `timeout` on macOS (`1`), and stringified JSON `edit` arguments (`1`).
+
+To eliminate those multi-turn retry loops automatically without mutating prior KV-cache history:
+
+1. **Pre-validation auto-repairs in `local-context-guard.ts` (`message_end`):**
+   - **Stringified `edits` and `edits[i]` recovery:** Parses stringified JSON passed to `edit.edits` or individual `edit.edits[i]` items (stripping stray markdown fences or trailing commas) and normalizes snake_case aliases (`old_text`/`old_string` → `oldText`).
+   - **Safe `edit` whitespace cascade:** When literal `oldText` misses on disk, recovers unique CRLF/LF differences, unique contiguous trimmed-line blocks (only when match count `=== 1`, preserving disk indentation and shifting uniform `newText` indent), and unique outer-newline differences. Never guesses when `0` or `> 1` matches exist.
+   - **macOS GNU `timeout` stripping:** Removes `timeout <duration>` prefixes on Darwin hosts lacking a `timeout` binary so valid verification commands do not exit `127`.
+2. **Post-write/edit syntax hooks and recovery nudges (`tool_result`):**
+   - **Immediate syntax check:** Runs `python3 -m py_compile` (`.py`) and `node --check` (`.js`/`.mjs`/`.cjs`) silently on every `write`/`edit` success, surfacing compiler stderr immediately on failure so broken syntax never compounds.
+   - **`edit` anchor line hint & `agent-browser` nudge:** Reports the nearest matching line number (suggesting `write` for files `<= 150` lines) when `edit` still misses, and redirects repeated verification-script failures away from fragile regex DOM stubs toward real headless Chromium via `agent-browser` (`AGENT_BROWSER_SESSION="ui-$$"` + `agent-browser close`).
+3. **Future exploration:** Hashline (line-hash-anchored edits) as a lightweight optional editing mode if larger (`> 300`-line) files still incur exact-match misses.

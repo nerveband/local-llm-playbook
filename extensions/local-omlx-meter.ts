@@ -81,6 +81,24 @@ export function isLocalProviderModel(model: ExtensionContext["model"]): boolean 
   );
 }
 
+export function resolveSplashThinkingBudget(level: string | undefined): number | undefined {
+  switch (String(level || "").trim().toLowerCase()) {
+    case "minimal":
+      return 512;
+    case "low":
+      return 1024;
+    case "medium":
+      return 1536;
+    case "high":
+      return 2048;
+    case "xhigh":
+    case "max":
+      return 4096;
+    default:
+      return undefined;
+  }
+}
+
 export function resolveServerOrigin(model: ExtensionContext["model"]): string | null {
   const baseUrl = String((model as { baseUrl?: string } | undefined)?.baseUrl || "");
   if (baseUrl) {
@@ -431,6 +449,17 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
             preserve_thinking: true,
           };
           changed = true;
+        }
+        if (nextPayload.thinking_token_budget === undefined) {
+          const level =
+            typeof (pi as { getThinkingLevel?: () => string }).getThinkingLevel === "function"
+              ? (pi as { getThinkingLevel: () => string }).getThinkingLevel()
+              : undefined;
+          const budget = resolveSplashThinkingBudget(level);
+          if (budget !== undefined) {
+            nextPayload.thinking_token_budget = budget;
+            changed = true;
+          }
         }
       }
     }

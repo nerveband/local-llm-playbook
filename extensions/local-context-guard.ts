@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -182,6 +183,400 @@ function isShellReadProbe(toolName: string, input: Record<string, unknown> | und
   return /^\s*(?:cat|head|tail|sed)\b/.test(cmd);
 }
 
+const MAX_REPAIR_FILE_BYTES = 2_097_152;
+const VERIFY_SCRIPT_CMD_RE =
+  /(?:^|[\s/])(?:_?verify|verify_|_?harness|test_)[a-zA-Z0-9_.-]*\.(?:js|mjs|cjs|py)\b/i;
+
+function resolveWorkspacePath(filePath: string, cwd: string): string | null {
+  const trimmed = filePath.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("~/")) {
+    return path.join(os.homedir(), trimmed.slice(2));
+  }
+  return path.isAbsolute(trimmed) ? trimmed : path.resolve(cwd, trimmed);
+}
+
+function tryParseJsonObjectOrArray(raw: string): unknown {
+  let cleaned = raw.trim();
+  if (!cleaned) return null;
+  const fence = cleaned.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```\s*$/i);
+  if (fence) {
+    cleaned = fence[1].trim();
+  }
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const noTrailing = cleaned.replace(/,\s*([}\]])/g, "$1");
+    try {
+      return JSON.parse(noTrailing);
+    } catch {
+      return null;
+    }
+  }
+}
+
+function normalizeEditItem(item: unknown): { value: Record<string, unknown> | null; changed: boolean } {
+  let obj: unknown = item;
+  let changed = false;
+  if (typeof item === "string") {
+    const parsed = tryParseJsonObjectOrArray(item);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { value: null, changed: false };
+    }
+    obj = parsed;
+    changed = true;
+  }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+    return { value: null, changed: false };
+  }
+  const rec = obj as Record<string, unknown>;
+  if (typeof rec.oldText !== "string") {
+    const aliasOld = typeof rec.old_text === "string" ? rec.old_text : typeof rec.old_string === "string" ? rec.old_string : null;
+    if (aliasOld !== null) {
+      rec.oldText = aliasOld;
+      changed = true;
+    }
+  }
+  if (typeof rec.newText !== "string") {
+    const aliasNew = typeof rec.new_text === "string" ? rec.new_text : typeof rec.new_string === "string" ? rec.new_string : null;
+    if (aliasNew !== null) {
+      rec.newText = aliasNew;
+      changed = true;
+    }
+  }
+  return { value: rec, changed };
+}
+
+function countLiteralOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let idx = 0;
+  while (true) {
+    const found = haystack.indexOf(needle, idx);
+    if (found === -1) break;
+    count += 1;
+    idx = found + needle.length;
+  }
+  return count;
+}
+
+function splitLinesWithEol(text: string): { text: string; eol: string; start: number }[] {
+  const out: { text: string; eol: string; start: number }[] = [];
+  const re = /([^\r\n]*)(\r\n|\n|\r|$)/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    if (match[0] === "" && re.lastIndex >= text.length) break;
+    out.push({ text: match[1], eol: match[2], start: match.index });
+    if (match[0] === "") break;
+  }
+  return out;
+}
+
+function leadingSpaces(line: string): string {
+  const m = line.match(/^([ \t]*)/);
+  return m ? m[1] : "";
+}
+
+function shiftBlockIndent(text: string, oldNonEmpty: string[], diskNonEmpty: string[]): string {
+  if (oldNonEmpty.length === 0 || oldNonEmpty.length !== diskNonEmpty.length) return text;
+  const oldIndent0 = leadingSpaces(oldNonEmpty[0]);
+  const diskIndent0 = leadingSpaces(diskNonEmpty[0]);
+  const oldSpacesOnly = /^[ ]*$/.test(oldIndent0) && /^[ ]*$/.test(diskIndent0);
+  if (!oldSpacesOnly) return text;
+  const delta = diskIndent0.length - oldIndent0.length;
+  if (delta === 0) return text;
+  for (let i = 1; i < oldNonEmpty.length; i++) {
+    const d = leadingSpaces(diskNonEmpty[i]).length - leadingSpaces(oldNonEmpty[i]).length;
+    if (!/^[ ]*$/.test(leadingSpaces(oldNonEmpty[i])) || !/^[ ]*$/.test(leadingSpaces(diskNonEmpty[i])) || d !== delta) {
+      return text;
+    }
+  }
+  return text
+    .split(/(\r\n|\n)/)
+    .map((part) => {
+      if (part === "\n" || part === "\r\n" || part.trim() === "") return part;
+      if (delta > 0) return " ".repeat(delta) + part;
+      const rm = Math.min(-delta, leadingSpaces(part).length);
+      return part.slice(rm);
+    })
+    .join("");
+}
+
+/** Repair stringified edit arguments and recover unique whitespace/line-ending mismatches safely. */
+export function repairEditArguments(args: Record<string, unknown>, cwd: string): boolean {
+  let changed = false;
+
+  if (typeof args.edits === "string") {
+    const parsed = tryParseJsonObjectOrArray(args.edits);
+    if (Array.isArray(parsed)) {
+      args.edits = parsed;
+      changed = true;
+    } else if (parsed && typeof parsed === "object") {
+      args.edits = [parsed];
+      changed = true;
+    }
+  }
+
+  if (Array.isArray(args.edits)) {
+    const nextEdits: unknown[] = [];
+    for (const item of args.edits) {
+      const norm = normalizeEditItem(item);
+      if (norm.value) {
+        nextEdits.push(norm.value);
+        if (norm.changed) changed = true;
+      } else {
+        nextEdits.push(item);
+      }
+    }
+    args.edits = nextEdits;
+  } else {
+    const normTop = normalizeEditItem(args);
+    if (normTop.changed) changed = true;
+  }
+
+  const filePath = String(args.path ?? args.file_path ?? "");
+  const absPath = resolveWorkspacePath(filePath, cwd);
+  if (!absPath) return changed;
+
+  let diskText = "";
+  try {
+    const stat = fs.statSync(absPath);
+    if (!stat.isFile() || stat.size > MAX_REPAIR_FILE_BYTES) return changed;
+    diskText = fs.readFileSync(absPath, "utf-8");
+  } catch {
+    return changed;
+  }
+
+  const editTargets: Record<string, unknown>[] = [];
+  if (Array.isArray(args.edits)) {
+    for (const entry of args.edits) {
+      if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+        const rec = entry as Record<string, unknown>;
+        if (typeof rec.oldText === "string" && typeof rec.newText === "string") {
+          editTargets.push(rec);
+        }
+      }
+    }
+  } else if (typeof args.oldText === "string" && typeof args.newText === "string") {
+    editTargets.push(args);
+  }
+
+  const diskSegs = splitLinesWithEol(diskText);
+  const diskUsesCrlf = diskText.includes("\r\n");
+
+  for (const edit of editTargets) {
+    const oldText = edit.oldText as string;
+    const newText = edit.newText as string;
+    if (!oldText || diskText.includes(oldText)) continue;
+
+    // Cascade 1: unique CRLF <-> LF line-ending match.
+    const normDisk = diskText.replace(/\r\n/g, "\n");
+    const normOld = oldText.replace(/\r\n/g, "\n");
+    if (normOld && countLiteralOccurrences(normDisk, normOld) === 1) {
+      const normSegs = splitLinesWithEol(normDisk);
+      const matchStart = normDisk.indexOf(normOld);
+      const matchEnd = matchStart + normOld.length;
+      let startIdx = -1;
+      let endIdx = -1;
+      for (let i = 0; i < normSegs.length && i < diskSegs.length; i++) {
+        const nStart = normSegs[i].start;
+        const nEnd = nStart + normSegs[i].text.length + normSegs[i].eol.length;
+        if (startIdx === -1 && matchStart >= nStart && (matchStart < nEnd || i === normSegs.length - 1)) {
+          startIdx = diskSegs[i].start + (matchStart - nStart);
+        }
+        if (matchEnd >= nStart && matchEnd <= nEnd) {
+          endIdx = diskSegs[i].start + Math.min(matchEnd - nStart, diskSegs[i].text.length + diskSegs[i].eol.length);
+          break;
+        }
+      }
+      if (startIdx >= 0 && endIdx > startIdx) {
+        const exactSlice = diskText.slice(startIdx, endIdx);
+        if (exactSlice && countLiteralOccurrences(diskText, exactSlice) === 1) {
+          edit.oldText = exactSlice;
+          if (diskUsesCrlf && !newText.includes("\r\n")) {
+            edit.newText = newText.replace(/\n/g, "\r\n");
+          } else if (!diskUsesCrlf && newText.includes("\r\n")) {
+            edit.newText = newText.replace(/\r\n/g, "\n");
+          }
+          changed = true;
+          continue;
+        }
+      }
+    }
+
+    // Cascade 2: unique contiguous trimmed-line block match.
+    const endedWithNewline = /\r?\n$/.test(oldText);
+    const oldLines = oldText.split(/\r?\n/);
+    if (endedWithNewline) oldLines.pop();
+    if (oldLines.length >= 1 && oldLines.some((l) => l.trim().length > 0)) {
+      const matches: number[] = [];
+      for (let s = 0; s <= diskSegs.length - oldLines.length; s++) {
+        let ok = true;
+        for (let k = 0; k < oldLines.length; k++) {
+          if (diskSegs[s + k].text.trim() !== oldLines[k].trim()) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) {
+          matches.push(s);
+          if (matches.length > 1) break;
+        }
+      }
+      if (matches.length === 1) {
+        const startSegIdx = matches[0];
+        const endSegIdx = startSegIdx + oldLines.length - 1;
+        const startByte = diskSegs[startSegIdx].start;
+        const endByte =
+          diskSegs[endSegIdx].start +
+          diskSegs[endSegIdx].text.length +
+          (endedWithNewline ? diskSegs[endSegIdx].eol.length : 0);
+        const exactSlice = diskText.slice(startByte, endByte);
+        if (exactSlice && countLiteralOccurrences(diskText, exactSlice) === 1) {
+          const oldNonEmpty = oldLines.filter((l) => l.trim().length > 0);
+          const diskNonEmpty = diskSegs
+            .slice(startSegIdx, endSegIdx + 1)
+            .map((seg) => seg.text)
+            .filter((l) => l.trim().length > 0);
+          edit.oldText = exactSlice;
+          edit.newText = shiftBlockIndent(newText, oldNonEmpty, diskNonEmpty);
+          changed = true;
+          continue;
+        }
+      }
+    }
+
+    // Cascade 3: unique outer-whitespace trim match.
+    const trimmedOld = oldText.trim();
+    if (trimmedOld.length >= 8 && trimmedOld !== oldText && countLiteralOccurrences(diskText, trimmedOld) === 1) {
+      edit.oldText = trimmedOld;
+      const hadLeadingNl = /^\s*\n/.test(oldText) && /^\s*\n/.test(newText);
+      const hadTrailingNl = /\n\s*$/.test(oldText) && /\n\s*$/.test(newText);
+      if (hadLeadingNl || hadTrailingNl) {
+        edit.newText = newText.trim();
+      }
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
+function defaultHasTimeoutBinary(): boolean {
+  if (process.platform !== "darwin") return true;
+  return (
+    fs.existsSync("/opt/homebrew/bin/timeout") ||
+    fs.existsSync("/usr/local/bin/timeout") ||
+    fs.existsSync("/usr/bin/timeout")
+  );
+}
+
+/** Strip missing GNU `timeout` prefix from macOS shell segments so bash does not exit 127. */
+export function repairMacOsTimeoutCommand(cmd: string, hasTimeoutBin = defaultHasTimeoutBinary()): string {
+  if (hasTimeoutBin || !cmd || !/\btimeout\b/.test(cmd)) return cmd;
+  return cmd.replace(
+    /(^|&&|\|\||;|\()\s*(?:command\s+)?timeout\s+(?:(?:-[a-zA-Z]|--[a-zA-Z0-9_-]+(?:=\S+)?)\s+(?:[^\s-]\S*\s+)?)*\d+(?:\.\d+)?[smhd]?\s+/g,
+    (_m, sep: string) => (sep ? `${sep} ` : ""),
+  );
+}
+
+/** Run lightweight compile-time syntax validation after Python or JS write/edit calls. */
+export function checkSyntaxForFile(filePath: string, cwd: string): string | null {
+  const absPath = resolveWorkspacePath(filePath, cwd);
+  if (!absPath || !fs.existsSync(absPath)) return null;
+  const ext = path.extname(absPath).toLowerCase();
+  let cmd = "";
+  let cmdArgs: string[] = [];
+  if (ext === ".py") {
+    cmd = "python3";
+    cmdArgs = ["-m", "py_compile", absPath];
+  } else if (ext === ".js" || ext === ".mjs" || ext === ".cjs") {
+    cmd = "node";
+    cmdArgs = ["--check", absPath];
+  } else {
+    return null;
+  }
+
+  try {
+    execFileSync(cmd, cmdArgs, {
+      cwd,
+      timeout: 5000,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return null;
+  } catch (err: any) {
+    if (err?.code === "ENOENT") return null;
+    const raw = String(err?.stderr || err?.stdout || err?.message || "Syntax error").trim();
+    return raw.length > 600 ? `${raw.slice(0, 600)}...` : raw;
+  }
+}
+
+/** Locate the closest anchor line when `edit` cannot find an exact `oldText` match. */
+export function findClosestEditLineHint(filePath: string, oldText: string, cwd: string): string | null {
+  const absPath = resolveWorkspacePath(filePath, cwd);
+  if (!absPath || !oldText) return null;
+  let diskLines: string[];
+  try {
+    const stat = fs.statSync(absPath);
+    if (!stat.isFile() || stat.size > MAX_REPAIR_FILE_BYTES) return null;
+    diskLines = fs.readFileSync(absPath, "utf-8").split(/\r?\n/);
+  } catch {
+    return null;
+  }
+
+  const candidates = oldText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  if (candidates.length === 0) return null;
+  const ordered = [
+    ...candidates.filter((l) => l.length >= 5).sort((a, b) => b.length - a.length),
+    ...candidates.filter((l) => l.length < 5),
+  ];
+
+  let bestLine = -1;
+  for (const cand of ordered) {
+    for (let i = 0; i < diskLines.length; i++) {
+      if (diskLines[i].trim() === cand) {
+        bestLine = i + 1;
+        break;
+      }
+    }
+    if (bestLine > 0) break;
+  }
+
+  if (bestLine === -1) {
+    const anchor = ordered[0];
+    const anchorTokens = anchor.toLowerCase().split(/\W+/).filter((t) => t.length >= 2);
+    if (anchorTokens.length > 0) {
+      let bestScore = 0;
+      for (let i = 0; i < diskLines.length; i++) {
+        const lower = diskLines[i].toLowerCase();
+        if (!lower.trim()) continue;
+        let hits = 0;
+        for (const tok of anchorTokens) {
+          if (lower.includes(tok)) hits += 1;
+        }
+        const score = hits / anchorTokens.length;
+        if (score >= 0.6 && score > bestScore) {
+          bestScore = score;
+          bestLine = i + 1;
+        }
+      }
+    }
+  }
+
+  const total = diskLines.length;
+  const rewriteTip = total <= 150
+    ? `File is only ${total} lines: use write(path, content) to replace it cleanly if escaping keeps failing.`
+    : `Inspect around there with read(path, offset, limit=35) before retrying edit.`;
+  if (bestLine > 0) {
+    return `[Edit recovery hint: Closest matching line in ${path.basename(absPath)} (${total} lines) is near line ${bestLine}. ${rewriteTip}]`;
+  }
+  return `[Edit recovery hint: Text not found in ${path.basename(absPath)} (${total} lines). ${rewriteTip}]`;
+}
+
 export default function localContextGuardExtension(pi: ExtensionAPI) {
   let consecutiveErrors = 0;
   let lastErrorSignature = "";
@@ -189,6 +584,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
   let consecutiveSameCall = 0;
   let consecutivePythonProbes = 0;
   let consecutiveShellReadProbes = 0;
+  let consecutiveVerifyScriptErrors = 0;
 
   pi.on("session_start", () => {
     consecutiveErrors = 0;
@@ -197,6 +593,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     consecutiveSameCall = 0;
     consecutivePythonProbes = 0;
     consecutiveShellReadProbes = 0;
+    consecutiveVerifyScriptErrors = 0;
   });
 
   pi.on("input", () => {
@@ -206,6 +603,36 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     consecutiveSameCall = 0;
     consecutivePythonProbes = 0;
     consecutiveShellReadProbes = 0;
+    consecutiveVerifyScriptErrors = 0;
+  });
+
+  // Run auto-repairs before Pi schema validation and tool_call execution.
+  pi.on("message_end", (event, ctx) => {
+    const msg = event.message as { role?: string; content?: unknown[] } | undefined;
+    if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) return;
+
+    let repaired = false;
+    for (const part of msg.content) {
+      if (!part || typeof part !== "object" || Array.isArray(part)) continue;
+      const call = part as { type?: string; name?: string; arguments?: unknown };
+      if (call.type !== "toolCall" || !call.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments)) {
+        continue;
+      }
+      const args = call.arguments as Record<string, unknown>;
+      if (call.name === "edit") {
+        if (repairEditArguments(args, ctx.cwd)) {
+          repaired = true;
+        }
+      } else if (call.name === "bash" && typeof args.command === "string") {
+        const nextCmd = repairMacOsTimeoutCommand(args.command);
+        if (nextCmd !== args.command) {
+          args.command = nextCmd;
+          repaired = true;
+        }
+      }
+    }
+
+    return repaired ? { message: event.message as any } : undefined;
   });
 
   pi.on("tool_call", (event) => {
@@ -357,6 +784,46 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
 
     const fullText = textBlocks.map((block) => block.text).join("\n");
     const lineCount = fullText ? fullText.split(/\r?\n/).length : 0;
+
+    if ((toolName === "write" || toolName === "edit") && !event.isError) {
+      const targetPath = String(event.input?.path ?? event.input?.file_path ?? "");
+      const syntaxErr = checkSyntaxForFile(targetPath, ctx.cwd);
+      if (syntaxErr) {
+        hints.push(
+          `[Auto syntax check FAILED for ${targetPath}:\n${syntaxErr}\nFix this syntax error immediately before running or moving on.]`,
+        );
+      }
+    }
+
+    if (toolName === "bash") {
+      const cmd = typeof event.input?.command === "string" ? event.input.command : "";
+      if (!event.isError || /\bagent-browser\b/.test(cmd)) {
+        consecutiveVerifyScriptErrors = 0;
+      } else if (VERIFY_SCRIPT_CMD_RE.test(cmd)) {
+        consecutiveVerifyScriptErrors += 1;
+        if (consecutiveVerifyScriptErrors >= 2) {
+          hints.push(
+            '[Browser verification nudge: Stop debugging fragile Node DOM/regex stubs. Open the built HTML directly in real headless Chromium using AGENT_BROWSER_SESSION="ui-$$" agent-browser open file:///ABS/PATH/review.html, run snapshot -i or eval, and close with agent-browser close.]',
+          );
+        }
+      }
+    }
+
+    if (toolName === "edit" && event.isError && /Could not find the exact text/i.test(fullText)) {
+      const targetPath = String(event.input?.path ?? event.input?.file_path ?? "");
+      const editsArr = Array.isArray(event.input?.edits) ? (event.input.edits as Record<string, unknown>[]) : null;
+      const firstOldText = String(editsArr?.[0]?.oldText ?? event.input?.oldText ?? "");
+      const lineHint = findClosestEditLineHint(targetPath, firstOldText, ctx.cwd);
+      if (lineHint) {
+        hints.push(lineHint);
+      }
+    }
+
+    if (toolName === "bash" && event.isError && /\b(?:SyntaxError|IndentationError|TabError)\b/.test(fullText)) {
+      hints.push(
+        "[Syntax recovery hint: Inspect the exact failing line with read(path, offset, limit) and fix it with edit (or rewrite with write if <= 150 lines) before re-running.]",
+      );
+    }
 
     let maxChars = 0;
     let maxLines = 0;

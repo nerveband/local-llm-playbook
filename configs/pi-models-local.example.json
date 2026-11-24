@@ -98,9 +98,9 @@
           },
           "thinkingLevelMap": {
             "off": null,
-            "minimal": null,
-            "low": null,
-            "medium": null,
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
             "high": "high"
           }
         }
