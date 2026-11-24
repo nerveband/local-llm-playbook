@@ -34,10 +34,10 @@ Living field guide for keeping local coding and data-analysis sessions fast, acc
 
 Mid-turn truncation (`Response was truncated before completion` / `finish_reason=length`) happens when `compaction.reserveTokens` is smaller than `maxTokens`:
 
-- **Inkling (`contextWindow: 131072`, `maxTokens: 16384`):**
-  - `reserveTokens: 24576` triggers clean compaction between tool calls around `106,496` tokens (`81.25%`), guaranteeing a full `16384`-token output runway on every turn.
+- **Inkling (`contextWindow: 131072`, `maxTokens: 32768`):**
+  - `reserveTokens: 36864` triggers clean compaction between tool calls around `94,208` tokens (`71.9%`), guaranteeing a full `32,768`-token output runway on every turn so multi-file builds never hit mid-turn `finish_reason=length` truncation after deep thinking.
   - `keepRecentTokens: 12000` keeps the post-compaction slice tight so cold prefill finishes fast.
-  - `modelThinkingLevels["inkling-local/inkling"] = "medium"` avoids burning 3,000+ thinking tokens on simple file reads. Override with `pi-local --think low` or `--no-think` for routine extraction loops.
+  - `modelThinkingLevels["inkling-local/inkling"] = "medium"` avoids burning 3,000+ thinking tokens on simple file reads. Pass `pi-local --inkling --think low` when executing a complete pre-written UI/script spec so Inkling does not burn `10K+` thinking tokens before writing code.
 - **Ornith (`contextWindow: 262144`, `maxTokens: 32768`):**
   - `reserveTokens: 131072` compacts cleanly halfway (`131,072` tokens) with `32,768` output headroom intact, keeping decode near peak speed and KV RAM bounded.
   - `modelThinkingLevels["omlx-local/Ornith-1.5-35B-A3B-Abliterated-MLX-4bit"] = "high"` keeps thinking on by default; pass `pi-local --ornith --no-think` when you want fast direct code or prose generation.
@@ -103,5 +103,5 @@ Note: `pi-continue` emits an npm deprecation notice as of `0.9.3`, so pass `--no
 
 1. **Always create `notes.md` early.** Record verified column spellings, key counts, edge cases, generated file paths, and open TODOs. After any `/next-phase`, `/handoff`, or compaction, read `notes.md` first.
 2. **Never dump raw CSVs or giant JSON blobs into stdout.** Write scripts that inspect schema + row counts + `3` to `5` sample rows, compute distributions in Python, and write full outputs to disk (`results.json`, `review.html`). Cap printed summaries under `20` lines.
-3. **Write `.py` and `.html` files with `write`/`edit` tools.** Avoid bash heredocs (`<<EOF`), which trigger quoting bugs and waste generation tokens.
-4. **Reset sessions around `32K` tokens.** Lower thinking to `low` or `off` (`Shift+Tab`) during mechanical code-writing phases for peak `~61` to `65 tok/s`, and let `phase_handoff` + `/next-phase` keep phases fast in fresh sessions.
+3. **Write concise scripts and modular `.css`/`.html`/`.js` assets with `write`/`edit`.** Never embed large HTML/CSS/JS bundles inside one Python string, and avoid bash heredocs (`<<EOF`). Split UI outputs into separate template files (`<= 300` lines each) plus a tiny builder script so every `write` stays well under output limits.
+4. **Reset sessions around `32K` tokens.** Use `--think low` (`Shift+Tab`) when executing pre-written UI or script specs (`~50%` faster turns and zero thinking bloat), and let `phase_handoff` + `/next-phase` carry `next_thinking_level` across fresh sessions.

@@ -29,7 +29,7 @@
             "cacheWrite": 0
           },
           "contextWindow": 131072,
-          "maxTokens": 16384,
+          "maxTokens": 32768,
           "compat": {
             "thinkingFormat": "openai",
             "supportsReasoningEffort": true,

@@ -7,7 +7,7 @@
   "compaction": {
     "modelOverrides": {
       "inkling-local/inkling": {
-        "reserveTokens": 24576,
+        "reserveTokens": 36864,
         "keepRecentTokens": 12000
       },
       "omlx-local/Ornith-1.5-35B-A3B-Abliterated-MLX-4bit": {
