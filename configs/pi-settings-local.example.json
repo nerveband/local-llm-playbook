@@ -15,7 +15,7 @@
         "keepRecentTokens": 12000
       },
       "surogate-local/surogate": {
-        "reserveTokens": 24576,
+        "reserveTokens": 36864,
         "keepRecentTokens": 12000
       }
     }

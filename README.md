@@ -81,7 +81,7 @@ pi-local --surogate --print-cmd
 - [`scripts/install-local-extensions.sh`](scripts/install-local-extensions.sh): Installs `pi-handoff`, `pi-continue`, and `pi-subagents` into `~/.local/share/pi-local-extensions` and symlinks `pi-local`.
 - [`prompts/local-lean-rules.md`](prompts/local-lean-rules.md): Short system prompt rules for disk-backed state (`notes.md`), batched read-only schema checks, `read`/`edit` over `bash cat`/heredocs, direct `~/.config/skillshare/skills-shared/` path loading, `20`-line stdout cap, `phase_handoff`, and Adversarial Self-Check before finishing.
 - [`configs/pi-models-local.example.json`](configs/pi-models-local.example.json): Local provider definitions (`inkling-local` on `18089`, `omlx-local` on `8000`, `surogate-local` on `18091` with `131072` context and `32768` max output).
-- [`configs/pi-settings-local.example.json`](configs/pi-settings-local.example.json): Per-model thinking and compaction overrides for Inkling (`medium`, `reserveTokens: 36864` with `maxTokens: 32768`), Ornith (`high`, `reserveTokens: 131072`), and Surogate (`high`, `reserveTokens: 24576`).
+- [`configs/pi-settings-local.example.json`](configs/pi-settings-local.example.json): Per-model thinking and compaction overrides for Inkling (`medium`, `reserveTokens: 36864` with `maxTokens: 32768`), Ornith (`high`, `reserveTokens: 131072`), and Surogate (`high`, `reserveTokens: 36864` with `maxTokens: 32768`).
 - [`BEST_PRACTICES.md`](BEST_PRACTICES.md): Apple Silicon memory balance, KV prefix caching, compaction math, Ornith workflow, and subagent concurrency guidelines.
 - [`PROMPTS.md`](PROMPTS.md): Copy-paste prompts for large tabular datasets, refactors, mid-session nudges, and phase transitions.
 
