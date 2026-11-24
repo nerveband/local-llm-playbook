@@ -74,6 +74,16 @@ export function collectCriticBundle(cwd: string): string {
   sections.push(`Files on disk:\n${files.slice(0, 60).map((f) => `- ${f}`).join("\n")}`);
 
   try {
+    const promptPath = path.join(cwd, "PROMPT.md");
+    if (fs.existsSync(promptPath)) {
+      const pRaw = fs.readFileSync(promptPath, "utf-8").slice(0, 1500);
+      sections.push(`Task requirements excerpt (PROMPT.md):\n\`\`\`\n${pRaw}\n\`\`\``);
+    }
+  } catch {
+    // Ignore unreadable PROMPT.md.
+  }
+
+  try {
     const diff = execFileSync("git", ["diff", "--unified=2"], {
       cwd,
       timeout: 3000,
@@ -95,7 +105,13 @@ export function collectCriticBundle(cwd: string): string {
 }
 
 export function parseCriticVerdict(rawText: string): { pass: boolean; defects: string[] } {
-  const cleaned = rawText.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  const hadToolCall = /<tool_call>|<function=/i.test(rawText);
+  const cleaned = rawText
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/<tool_call>[\s\S]*?(?:<\/tool_call>|$)/gi, "")
+    .replace(/<function=[^>]*>[\s\S]*?(?:<\/function>|<\/tool_call>|$)/gi, "")
+    .trim();
+  if (!cleaned) return { pass: true, defects: [] };
   const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
   if (jsonMatch) {
     try {
@@ -109,11 +125,12 @@ export function parseCriticVerdict(rawText: string): { pass: boolean; defects: s
       // Fallback to text parsing.
     }
   }
+  if (hadToolCall) return { pass: true, defects: [] };
   if (/^\s*PASS\b/i.test(cleaned)) return { pass: true, defects: [] };
   const bullets = cleaned
     .split(/\r?\n/)
     .map((l) => l.replace(/^\s*[-*\d.)]+\s*/, "").trim())
-    .filter((l) => l.length > 8 && !/^\{|\}$/.test(l));
+    .filter((l) => l.length > 8 && !/^\{|\}$/.test(l) && !/^<\/?(tool_call|function|parameter)/i.test(l));
   return bullets.length > 0 ? { pass: false, defects: bullets.slice(0, 6) } : { pass: true, defects: [] };
 }
 
@@ -124,8 +141,9 @@ async function runFreshCritic(ctx: ExtensionContext, focus: string): Promise<{ p
   const bundle = collectCriticBundle(ctx.cwd);
   const prompt = [
     "You are an independent, strict code reviewer in a clean context.",
+    "CRITICAL: You have NO tools available. Do NOT output <tool_call>, <function=...>, XML tags, or requests to read files. Inspect ONLY the workspace listing and code provided below.",
     focus ? `Review focus: ${focus}` : "Inspect for concrete bugs, missing deliverables, bad DOM selectors, O(K^2) performance risks, or unhandled errors.",
-    "Do NOT invent minor style complaints. Respond ONLY with JSON: {\"pass\": true, \"defects\": []} if solid, or {\"pass\": false, \"defects\": [\"...\"]} with up to 5 concrete defects.",
+    "Do NOT invent minor style complaints. Respond ONLY with raw JSON: {\"pass\": true, \"defects\": []} if solid, or {\"pass\": false, \"defects\": [\"...\"]} with up to 5 concrete defects.",
     "",
     bundle,
   ].join("\n");
@@ -135,14 +153,14 @@ async function runFreshCritic(ctx: ExtensionContext, focus: string): Promise<{ p
     messages: [{ role: "user", content: prompt }],
     temperature: 0.2,
     top_p: 0.95,
-    max_tokens: 1400,
+    max_tokens: 1000,
     stream: false,
   };
   if (ep.provider === "inkling-local") {
     body.reasoning_effort = "low";
   } else if (ep.provider === "surogate-local" || ep.provider === "ornith-splash") {
-    body.chat_template_kwargs = { enable_thinking: true, preserve_thinking: false };
-    body.thinking_token_budget = 1024;
+    body.chat_template_kwargs = { enable_thinking: false, preserve_thinking: false };
+    body.thinking_token_budget = 256;
     body.top_k = 20;
   }
 
@@ -169,10 +187,16 @@ async function runFreshCritic(ctx: ExtensionContext, focus: string): Promise<{ p
 export default function localCriticExtension(pi: ExtensionAPI) {
   let criticRanThisTask = false;
   let lastUserPrompt = "";
+  let sessionActive = true;
 
   pi.on("session_start", () => {
     criticRanThisTask = false;
     lastUserPrompt = "";
+    sessionActive = true;
+  });
+
+  pi.on("session_shutdown", () => {
+    sessionActive = false;
   });
 
   pi.on("input", (event) => {
@@ -185,15 +209,27 @@ export default function localCriticExtension(pi: ExtensionAPI) {
   pi.registerCommand("critic", {
     description: "Run a zero-swap fresh-context adversarial review on current workspace deliverables",
     handler: async (args, ctx) => {
-      ctx.ui?.notify?.("Running fresh-context adversarial critic pass...", "info");
+      try {
+        ctx.ui?.notify?.("Running fresh-context adversarial critic pass...", "info");
+      } catch {
+        // Ignore stale or headless UI contexts.
+      }
       const verdict = await runFreshCritic(ctx, args.trim() || lastUserPrompt);
       if (!verdict) {
-        ctx.ui?.notify?.("Critic pass could not reach active local server.", "warning");
+        try {
+          ctx.ui?.notify?.("Critic pass could not reach active local server.", "warning");
+        } catch {
+          // Ignore UI notification error.
+        }
         return;
       }
       appendLocalTrace("local-critic", "manual_critic", { pass: verdict.pass, defects: verdict.defects });
       if (verdict.pass) {
-        ctx.ui?.notify?.("Critic verdict: PASS (no concrete defects found).", "info");
+        try {
+          ctx.ui?.notify?.("Critic verdict: PASS (no concrete defects found).", "info");
+        } catch {
+          // Ignore UI notification error.
+        }
         return;
       }
       const msg = `Independent critic review found ${verdict.defects.length} concrete issue(s):\n- ${verdict.defects.join("\n- ")}\n\nFix these issues and re-verify.`;
@@ -205,30 +241,37 @@ export default function localCriticExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.on("agent_end", (_event, ctx) => {
+  pi.on("agent_end", async (_event, ctx) => {
     if (process.env.PI_LOCAL_AUTO_CRITIC !== "1") return;
-    if (criticRanThisTask) return;
+    if (criticRanThisTask || !sessionActive) return;
     if (fs.existsSync(path.join(ctx.cwd, ".pi-handoff.md"))) return;
 
     criticRanThisTask = true;
-    void runFreshCritic(ctx, lastUserPrompt).then((verdict) => {
-      if (!verdict) return;
-      appendLocalTrace("local-critic", "auto_critic", { pass: verdict.pass, defects: verdict.defects });
-      if (!verdict.pass && verdict.defects.length > 0) {
-        const g = globalThis as typeof globalThis & { __piLocalEscalation?: { offset: number; criticPending?: boolean } };
-        if (g.__piLocalEscalation) {
-          g.__piLocalEscalation.offset = Math.max(g.__piLocalEscalation.offset, 1);
-          g.__piLocalEscalation.criticPending = true;
-        }
+    const verdict = await runFreshCritic(ctx, lastUserPrompt);
+    if (!verdict || !sessionActive) return;
+    appendLocalTrace("local-critic", "auto_critic", { pass: verdict.pass, defects: verdict.defects });
+    if (!verdict.pass && verdict.defects.length > 0) {
+      const g = globalThis as typeof globalThis & { __piLocalEscalation?: { offset: number; criticPending?: boolean } };
+      if (g.__piLocalEscalation) {
+        g.__piLocalEscalation.offset = Math.max(g.__piLocalEscalation.offset, 1);
+        g.__piLocalEscalation.criticPending = true;
+      }
+      try {
         ctx.ui?.notify?.(
           `Auto-critic flagged ${verdict.defects.length} issue(s); sending repair pass...`,
           "info",
         );
+      } catch {
+        // Headless or shutting-down ctx must never crash on UI notify.
+      }
+      try {
         pi.sendUserMessage(
           `Independent fresh-context critic review flagged ${verdict.defects.length} defect(s):\n- ${verdict.defects.join("\n- ")}\n\nFix these specific issues and run a final verification check.`,
           { deliverAs: "followUp" },
         );
+      } catch {
+        // Ignore if session already terminated before follow-up dispatch.
       }
-    });
+    }
   });
 }

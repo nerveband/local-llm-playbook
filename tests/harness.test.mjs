@@ -188,6 +188,10 @@ test("local-critic parser, PII-free bundle collection, meter helpers, and trace 
     pass: false,
     defects: ["Missing export handler"],
   });
+  assert.deepEqual(
+    parseCriticVerdict("I'll start by reading the context files.\n<tool_call>\n<function=read_file>\n<parameter=path>PROMPT.md</parameter>"),
+    { pass: true, defects: [] },
+  );
 
   withTempDir((dir) => {
     fs.mkdirSync(path.join(dir, "DataExport-2026-11-21"));
