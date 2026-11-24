@@ -195,6 +195,7 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
   let lastCompletedSummary: string | null = null;
   let lastCtx: ExtensionContext | null = null;
   let ticker: ReturnType<typeof setInterval> | null = null;
+  let statusEndpointUnsupported = false;
 
   function safeSetStatus(ctx: ExtensionContext | null, text: string | undefined): void {
     if (disposed || !ctx) return;
@@ -342,8 +343,10 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
   }
 
   async function refreshOmlxStatus(ctx: ExtensionContext): Promise<OmlxStatusSnapshot | null> {
-    if (disposed) return null;
+    if (disposed || statusEndpointUnsupported) return null;
     if (!isLocalProviderModel(ctx.model)) return null;
+    const provider = String(ctx.model?.provider || "").toLowerCase();
+    if (provider === "surogate-local") return null;
     const origin = resolveServerOrigin(ctx.model);
     if (!origin) return null;
 
@@ -351,6 +354,10 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
       const response = await fetch(`${origin}/api/status`, {
         signal: AbortSignal.timeout(800),
       });
+      if (response.status === 404) {
+        statusEndpointUnsupported = true;
+        return null;
+      }
       if (disposed || !response.ok) return null;
       const body = (await response.json()) as Record<string, unknown>;
       if (disposed) return null;
@@ -380,12 +387,14 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
     activeTurn = false;
     lastCompletedSummary = null;
     latestStatusSnapshot = null;
+    statusEndpointUnsupported = false;
     safeSetStatus(ctx, "⚡ --");
   });
 
   pi.on("model_select", (_event, ctx) => {
     lastCtx = ctx;
     latestStatusSnapshot = null;
+    statusEndpointUnsupported = false;
   });
 
   pi.on("before_provider_request", (event, ctx) => {
@@ -393,21 +402,54 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
     if (!isLocalProviderModel(ctx.model)) return;
     const payload = event.payload as Record<string, unknown> | null;
     if (!payload || typeof payload !== "object") return;
-    if (payload.stream !== true) return;
 
-    const existing =
-      payload.stream_options && typeof payload.stream_options === "object"
-        ? (payload.stream_options as Record<string, unknown>)
-        : {};
-    if (existing.include_usage === true) return;
+    const provider = String(ctx.model?.provider || "").toLowerCase();
+    const nextPayload: Record<string, unknown> = { ...payload };
+    let changed = false;
 
-    return {
-      ...payload,
-      stream_options: {
-        ...existing,
-        include_usage: true,
-      },
-    };
+    if (provider === "surogate-local") {
+      if (nextPayload.temperature === undefined) {
+        nextPayload.temperature = 0.65;
+        changed = true;
+      }
+      if (nextPayload.top_p === undefined) {
+        nextPayload.top_p = 0.95;
+        changed = true;
+      }
+      if (nextPayload.top_k === undefined) {
+        nextPayload.top_k = 20;
+        changed = true;
+      }
+      const rawKwargs =
+        nextPayload.chat_template_kwargs && typeof nextPayload.chat_template_kwargs === "object"
+          ? (nextPayload.chat_template_kwargs as Record<string, unknown>)
+          : undefined;
+      if (rawKwargs?.enable_thinking === true || nextPayload.enable_thinking === true) {
+        if (rawKwargs?.preserve_thinking !== true) {
+          nextPayload.chat_template_kwargs = {
+            ...(rawKwargs ?? {}),
+            preserve_thinking: true,
+          };
+          changed = true;
+        }
+      }
+    }
+
+    if (nextPayload.stream === true) {
+      const existing =
+        nextPayload.stream_options && typeof nextPayload.stream_options === "object"
+          ? (nextPayload.stream_options as Record<string, unknown>)
+          : {};
+      if (existing.include_usage !== true) {
+        nextPayload.stream_options = {
+          ...existing,
+          include_usage: true,
+        };
+        changed = true;
+      }
+    }
+
+    return changed ? nextPayload : undefined;
   });
 
   pi.on("turn_start", (event, ctx) => {

@@ -174,16 +174,33 @@ export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
   let pendingHandoff: StagedHandoff | null = null;
   let warnedHighContext = false;
   let autoHandoffCount = 0;
+  let lastTurnContextTokens = 0;
 
   pi.on("session_start", (event, ctx) => {
     if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
       warnedHighContext = false;
+      lastTurnContextTokens = 0;
     }
     if (event.reason === "new") {
       const pendingLevel = consumeNextThinkSignal(ctx.cwd);
       if (pendingLevel) {
         pi.setThinkingLevel(pendingLevel as any);
       }
+    }
+  });
+
+  pi.on("message_end", (event) => {
+    const msg = event.message as { role?: string; usage?: Record<string, unknown> } | undefined;
+    if (!msg || msg.role !== "assistant" || !msg.usage) {
+      return;
+    }
+    const u = msg.usage;
+    const total = Math.max(
+      Number(u.totalTokens || 0),
+      Number(u.input || 0) + Number(u.cacheRead || 0) + Number(u.output || 0),
+    );
+    if (Number.isFinite(total) && total > 0) {
+      lastTurnContextTokens = total;
     }
   });
 
@@ -261,12 +278,20 @@ export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
     }
 
     const usage = ctx.getContextUsage();
-    if (!usage || typeof usage.tokens !== "number" || typeof usage.contextWindow !== "number" || usage.contextWindow <= 0) {
+    const tokens = Math.max(
+      usage && typeof usage.tokens === "number" ? usage.tokens : 0,
+      lastTurnContextTokens,
+    );
+    const contextWindow =
+      usage && typeof usage.contextWindow === "number" && usage.contextWindow > 0
+        ? usage.contextWindow
+        : Number((ctx.model as { contextWindow?: number } | undefined)?.contextWindow || 0);
+    if (tokens <= 0 || !Number.isFinite(contextWindow) || contextWindow <= 0) {
       return;
     }
 
-    const ratio = usage.tokens / usage.contextWindow;
-    const hitTokenLimit = HIGH_CONTEXT_TOKENS > 0 && usage.tokens >= HIGH_CONTEXT_TOKENS;
+    const ratio = tokens / contextWindow;
+    const hitTokenLimit = HIGH_CONTEXT_TOKENS > 0 && tokens >= HIGH_CONTEXT_TOKENS;
     if (!hitTokenLimit && ratio < HIGH_CONTEXT_RATIO) {
       return;
     }
@@ -278,7 +303,7 @@ export default function localPhaseHandoffExtension(pi: ExtensionAPI) {
         ...event.content,
         {
           type: "text",
-          text: `\n[Local speed notice: ${usage.tokens.toLocaleString()} tokens used (${pct}% of window). Local decode slows above 32K tokens. Update notes.md and call phase_handoff at the next clean milestone if more work remains.]`,
+          text: `\n[Local speed notice: ${tokens.toLocaleString()} tokens used (${pct}% of window). Local decode slows above 32K tokens. Update notes.md and call phase_handoff at the next clean milestone if more work remains.]`,
         },
       ],
       ...(event.structuredContent !== undefined ? { structuredContent: event.structuredContent } : {}),

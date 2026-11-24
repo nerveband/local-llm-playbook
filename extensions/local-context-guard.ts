@@ -126,7 +126,15 @@ function summarizeCallSignature(toolName: string, input: Record<string, unknown>
 
 const HARD_HEREDOC_CHARS = Number(process.env.PI_LOCAL_HARD_HEREDOC_CHARS || 1000);
 const NOTES_APPEND_MAX_CHARS = Number(process.env.PI_LOCAL_NOTES_HEREDOC_CHARS || 2500);
+const HARD_PYTHON_INLINE_CHARS = Number(process.env.PI_LOCAL_HARD_PYTHON_INLINE_CHARS || 800);
+const HARD_PYTHON_PROBE_STREAK = Number(process.env.PI_LOCAL_HARD_PYTHON_STREAK || 5);
 const INLINE_PROBE_STREAK_WARN = Number(process.env.PI_LOCAL_INLINE_PROBE_WARN || 3);
+
+function isTmpScratchPythonWrite(toolName: string, input: Record<string, unknown> | undefined): boolean {
+  if (toolName !== "write" || !input) return false;
+  const p = String(input.path ?? input.file_path ?? "");
+  return /^\/(?:private\/)?(?:var\/)?tmp\/.*\.py$/i.test(p);
+}
 
 function isHeredocCommand(toolName: string, input: Record<string, unknown> | undefined): { isHeredoc: boolean; length: number } {
   if (toolName !== "bash" || !input) return { isHeredoc: false, length: 0 };
@@ -212,6 +220,32 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     } else {
       lastCallSignature = sig;
       consecutiveSameCall = 1;
+    }
+
+    if (isTmpScratchPythonWrite(toolName, input)) {
+      return {
+        block: true,
+        reason:
+          "Local tool guard: do not write scratch Python scripts into /tmp. Write your real workspace deliverable (.py script in the current working directory) using write(path, content).",
+      };
+    }
+
+    if (isPythonInlineProbe(toolName, input)) {
+      const cmdLen = typeof input?.command === "string" ? input.command.length : 0;
+      if (cmdLen >= HARD_PYTHON_INLINE_CHARS) {
+        return {
+          block: true,
+          reason:
+            "Local tool guard: blocked large inline python3 -c script (>= 800 chars). Put reusable analysis logic into a real workspace .py file (for example inspect_schema.py or analyze_dupes.py) using write(path, content) instead of giant inline python3 -c commands.",
+        };
+      }
+      if (consecutivePythonProbes >= HARD_PYTHON_PROBE_STREAK) {
+        return {
+          block: true,
+          reason:
+            "Local tool guard: blocked excessive consecutive inline python3 -c probes. Stop exploratory probing and write your next workspace deliverable (.py script or notes.md) using write(path, content).",
+        };
+      }
     }
 
     if (isHardBlockedHeredocCommand(toolName, input)) {
