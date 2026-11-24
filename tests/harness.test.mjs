@@ -19,6 +19,7 @@ import { parseCriticVerdict, collectCriticBundle } from "../extensions/local-cri
 import {
   isSplashProvider,
   resolveEscalatedThinkingLevel,
+  resolveInklingReasoningEffort,
   resolveServerOrigin,
   resolveSplashThinkingBudget,
 } from "../extensions/local-omlx-meter.ts";
@@ -202,6 +203,9 @@ test("local-critic parser, PII-free bundle collection, meter helpers, and trace 
   assert.equal(isSplashProvider("inkling-local"), false);
   assert.equal(resolveServerOrigin({ provider: "ornith-splash" }), "http://127.0.0.1:18092");
   assert.equal(resolveSplashThinkingBudget("high"), 2048);
+  assert.equal(resolveInklingReasoningEffort("low"), "0.25");
+  assert.equal(resolveInklingReasoningEffort("medium"), "0.50");
+  assert.equal(resolveInklingReasoningEffort("high"), "0.75");
   assert.equal(resolveEscalatedThinkingLevel("low", 1), "medium");
   assert.equal(resolveEscalatedThinkingLevel("high", 2), "high");
 

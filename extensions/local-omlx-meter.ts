@@ -100,6 +100,27 @@ export function isSplashProvider(provider: string): boolean {
   return provider === "surogate-local" || provider === "ornith-splash";
 }
 
+export function resolveInklingReasoningEffort(level: string | undefined): string | undefined {
+  if (process.env.PI_LOCAL_INKLING_FLOAT_EFFORT === "0") return level;
+  switch (String(level || "").trim().toLowerCase()) {
+    case "off":
+      return "none";
+    case "minimal":
+      return "0.15";
+    case "low":
+      return "0.25";
+    case "medium":
+      return "0.50";
+    case "high":
+      return "0.75";
+    case "xhigh":
+    case "max":
+      return "0.90";
+    default:
+      return level;
+  }
+}
+
 export function resolveSplashThinkingBudget(level: string | undefined): number | undefined {
   switch (String(level || "").trim().toLowerCase()) {
     case "minimal":
@@ -465,6 +486,23 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
       }
       if (nextPayload.presence_penalty === undefined) {
         nextPayload.presence_penalty = 0.0;
+        changed = true;
+      }
+    }
+
+    if (provider === "inkling-local") {
+      const baseLevel =
+        typeof (pi as { getThinkingLevel?: () => string }).getThinkingLevel === "function"
+          ? (pi as { getThinkingLevel: () => string }).getThinkingLevel()
+          : undefined;
+      const g = globalThis as typeof globalThis & { __piLocalEscalation?: { offset?: number } };
+      const adaptiveEnabled = process.env.PI_LOCAL_ADAPTIVE_THINK === "1";
+      const effectiveLevel = adaptiveEnabled
+        ? resolveEscalatedThinkingLevel(baseLevel, Number(g.__piLocalEscalation?.offset || 0))
+        : baseLevel;
+      const mapped = resolveInklingReasoningEffort(effectiveLevel);
+      if (mapped && nextPayload.reasoning_effort !== mapped) {
+        nextPayload.reasoning_effort = mapped;
         changed = true;
       }
     }
