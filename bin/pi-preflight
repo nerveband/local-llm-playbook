@@ -11,15 +11,26 @@ import sys
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".next", "dist", "build"}
 
 
-def count_csv_rows(path: pathlib.Path) -> tuple[list[str], int]:
+def count_csv_rows(path: pathlib.Path) -> tuple[list[str], int, list[int]]:
     try:
         with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
             reader = csv.reader(f)
-            header = next(reader, [])
-            rows = sum(1 for _ in reader)
-            return [c.strip() for c in header], rows
+            header = [c.strip() for c in next(reader, [])]
+            seen: list[set[str]] = [set() for _ in header]
+            rows = 0
+            for row in reader:
+                rows += 1
+                limit = min(len(row), len(seen))
+                for idx in range(limit):
+                    bucket = seen[idx]
+                    if len(bucket) > 20:
+                        continue
+                    val = row[idx].strip()
+                    if val:
+                        bucket.add(val)
+            return header, rows, [len(s) for s in seen]
     except Exception:
-        return [], 0
+        return [], 0, []
 
 
 def main() -> int:
@@ -62,13 +73,19 @@ def main() -> int:
         lines.append("files:")
         lines.extend(tree_entries[:60])
 
-    # CSV schemas (headers + row count ONLY — zero row values for privacy)
+    # CSV schemas (headers + row count + bounded low-cardinality distinct counts — zero row values for privacy)
     if csv_files:
-        lines.append("csv_schemas (headers + row counts only):")
+        lines.append("csv_schemas (headers + row counts only; distinct<=20 noted on >=100 rows):")
         for csv_path in csv_files[:12]:
             rel = csv_path.relative_to(cwd)
-            cols, count = count_csv_rows(csv_path)
-            lines.append(f"- {rel}: {count} rows, {len(cols)} cols -> {', '.join(cols)}")
+            cols, count, distinct_counts = count_csv_rows(csv_path)
+            formatted_cols = [
+                f"{col} (distinct={d})" if count >= 100 and 1 <= d <= 20 else col
+                for col, d in zip(cols, distinct_counts)
+            ]
+            if len(formatted_cols) < len(cols):
+                formatted_cols.extend(cols[len(formatted_cols) :])
+            lines.append(f"- {rel}: {count} rows, {len(cols)} cols -> {', '.join(formatted_cols)}")
 
     pkg = cwd / "package.json"
     if pkg.is_file():

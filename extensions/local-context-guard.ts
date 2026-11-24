@@ -815,6 +815,102 @@ export function findClosestEditLineHint(filePath: string, oldText: string, cwd: 
   return `[Edit recovery hint: Text not found in ${path.basename(absPath)} (${total} lines). ${rewriteTip}]`;
 }
 
+export interface JsonClusterSkew {
+  file: string;
+  groupCount: number;
+  maxGroupSize: number;
+  totalItems: number;
+}
+
+const MAX_SKEW_SCAN_BYTES = 8 * 1024 * 1024;
+const GROUP_ARRAY_KEYS = ["groups", "clusters", "buckets", "components"] as const;
+const MEMBER_ARRAY_KEYS = ["records", "members", "constituents", "items", "rows"] as const;
+const MEMBER_COUNT_KEYS = ["record_count", "count", "size"] as const;
+
+/** Inspect recently written JSON cluster outputs for degenerate mega-clusters caused by low-cardinality joins. */
+export function inspectJsonClusterSkew(
+  cwd: string,
+  minMtimeMs: number,
+  isSlow: boolean,
+): JsonClusterSkew | null {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(cwd);
+  } catch {
+    return null;
+  }
+
+  let scanned = 0;
+  for (const name of entries) {
+    if (name.startsWith(".") || !name.endsWith(".json")) continue;
+    const absPath = path.join(cwd, name);
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(absPath);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_SKEW_SCAN_BYTES) continue;
+    if (stat.mtimeMs < minMtimeMs - 1000) continue;
+    scanned += 1;
+    if (scanned > 4) break;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(fs.readFileSync(absPath, "utf-8"));
+    } catch {
+      continue;
+    }
+
+    let groups: unknown[] | null = null;
+    if (Array.isArray(parsed)) {
+      groups = parsed;
+    } else if (parsed && typeof parsed === "object") {
+      const obj = parsed as Record<string, unknown>;
+      for (const key of GROUP_ARRAY_KEYS) {
+        if (Array.isArray(obj[key])) {
+          groups = obj[key] as unknown[];
+          break;
+        }
+      }
+    }
+    if (!groups || groups.length < 2) continue;
+
+    let maxGroupSize = 0;
+    let totalItems = 0;
+    let sizedGroups = 0;
+    for (const item of groups) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      let size = -1;
+      for (const mk of MEMBER_ARRAY_KEYS) {
+        if (Array.isArray(rec[mk])) {
+          size = (rec[mk] as unknown[]).length;
+          break;
+        }
+      }
+      if (size < 0) {
+        for (const ck of MEMBER_COUNT_KEYS) {
+          if (typeof rec[ck] === "number" && Number.isFinite(rec[ck] as number)) {
+            size = rec[ck] as number;
+            break;
+          }
+        }
+      }
+      if (size >= 0) {
+        sizedGroups += 1;
+        totalItems += size;
+        if (size > maxGroupSize) maxGroupSize = size;
+      }
+    }
+
+    if (sizedGroups >= 2 && (maxGroupSize >= 100 || (isSlow && maxGroupSize >= 50))) {
+      return { file: name, groupCount: sizedGroups, maxGroupSize, totalItems };
+    }
+  }
+  return null;
+}
+
 export default function localContextGuardExtension(pi: ExtensionAPI) {
   let consecutiveErrors = 0;
   let lastErrorSignature = "";
@@ -824,6 +920,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
   let consecutiveShellReadProbes = 0;
   let consecutiveVerifyScriptErrors = 0;
   let consecutiveAgentBrowserEvals = 0;
+  let slowBashCount = 0;
   let hadToolCallsInSession = false;
   let consecutivePrematureRetries = 0;
   let lastAssistantSnapshot: Omit<AssistantTurnSnapshot, "hadToolCallsInSession"> | null = null;
@@ -841,6 +938,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     consecutiveShellReadProbes = 0;
     consecutiveVerifyScriptErrors = 0;
     consecutiveAgentBrowserEvals = 0;
+    slowBashCount = 0;
     consecutivePrematureRetries = 0;
     lastAssistantSnapshot = null;
     bashStartTimes.clear();
@@ -1169,13 +1267,32 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       const callKey = String((event as { toolCallId?: string }).toolCallId || "last");
       const startedAt = bashStartTimes.get(callKey);
       bashStartTimes.delete(callKey);
-      if (startedAt !== undefined && SLOW_BASH_MS > 0) {
+      let isSlow = false;
+      if (startedAt !== undefined) {
         const elapsedMs = Date.now() - startedAt;
-        if (elapsedMs >= SLOW_BASH_MS) {
-          appendLocalTrace("local-context-guard", "bash_slow", { elapsedMs });
-          hints.push(
-            `[Runtime efficiency hint: That bash command took ${Math.round(elapsedMs / 1000)}s. Check for O(K^2) loops, unindexed joins, or mega-clusters on low-cardinality fields before re-running.]`,
-          );
+        if (SLOW_BASH_MS > 0 && elapsedMs >= SLOW_BASH_MS) {
+          isSlow = true;
+          slowBashCount += 1;
+          appendLocalTrace("local-context-guard", "bash_slow", { elapsedMs, slowBashCount });
+          const secs = Math.round(elapsedMs / 1000);
+          if (slowBashCount >= 2) {
+            hints.push(
+              `[ACTION REQUIRED: Repeated slow bash command (${secs}s, #${slowBashCount}). Stop re-running unchanged O(K^2) logic: inspect max group/bucket size and remove low-cardinality or empty join keys before proceeding.]`,
+            );
+          } else {
+            hints.push(
+              `[Runtime efficiency hint: That bash command took ${secs}s. Check for O(K^2) loops, unindexed joins, or mega-clusters on low-cardinality fields before re-running.]`,
+            );
+          }
+        }
+        if (!event.isError) {
+          const skew = inspectJsonClusterSkew(ctx.cwd, startedAt, isSlow);
+          if (skew) {
+            appendLocalTrace("local-context-guard", "cluster_skew", skew);
+            hints.push(
+              `[ACTION REQUIRED: Degenerate cluster skew detected in ${skew.file}: largest group has ${skew.maxGroupSize} items across ${skew.groupCount} groups (${skew.totalItems} total). A mega-cluster indicates joining or union-finding on a low-cardinality, default, or incomplete key (such as status, type, flag, or street-less address). Inspect the top groups, exclude low-cardinality keys, and re-run.]`,
+            );
+          }
         }
       }
 

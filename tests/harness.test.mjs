@@ -10,6 +10,7 @@ import {
   detectPrematureStop,
   extractAgentBrowserSessions,
   findClosestEditLineHint,
+  inspectJsonClusterSkew,
   lintFileIssues,
   repairEditArguments,
   repairMacOsTimeoutCommand,
@@ -239,5 +240,45 @@ test("pi-outline and pi-preflight run fast and never leak CSV rows", () => {
     assert.ok(elapsedMs < 1500, `pi-preflight took ${elapsedMs}ms`);
     assert.match(preflight, /accounts\.csv: 1 rows, 3 cols/);
     assert.ok(!preflight.includes("Test Donor"), "pi-preflight must never emit CSV data values");
+
+    const rows = ["Id,Status,Email"];
+    for (let i = 0; i < 120; i += 1) {
+      rows.push(`${i},${i % 2 === 0 ? "ActiveStatusValue" : "InactiveStatusValue"},user${i}@example.org`);
+    }
+    fs.writeFileSync(path.join(dir, "many.csv"), rows.join("\n"));
+    const manyOut = execFileSync(path.join(REPO_DIR, "bin/pi-preflight"), [dir], { encoding: "utf-8" });
+    assert.match(manyOut, /Status \(distinct=2\)/);
+    assert.doesNotMatch(manyOut, /Email \(distinct=/);
+    assert.ok(!manyOut.includes("ActiveStatusValue"), "pi-preflight must never leak low-cardinality values");
+    assert.ok(!manyOut.includes("user0@example.org"), "pi-preflight must never leak emails");
+  });
+});
+
+test("inspectJsonClusterSkew flags mega-clusters while ignoring healthy cluster sizes", () => {
+  withTempDir((dir) => {
+    const startMs = Date.now();
+    fs.writeFileSync(
+      path.join(dir, "healthy.json"),
+      JSON.stringify({ groups: [{ members: [1, 2] }, { members: [3, 4, 5] }] }),
+    );
+    assert.equal(inspectJsonClusterSkew(dir, startMs, false), null);
+
+    fs.writeFileSync(
+      path.join(dir, "mid.json"),
+      JSON.stringify({ groups: [{ record_count: 55 }, { record_count: 2 }] }),
+    );
+    assert.equal(inspectJsonClusterSkew(dir, startMs, false), null);
+    const slowMid = inspectJsonClusterSkew(dir, startMs, true);
+    assert.equal(slowMid?.file, "mid.json");
+    assert.equal(slowMid?.maxGroupSize, 55);
+
+    fs.writeFileSync(
+      path.join(dir, "skew.json"),
+      JSON.stringify({ groups: [{ records: new Array(120).fill(1) }, { records: [2, 3] }] }),
+    );
+    const bigSkew = inspectJsonClusterSkew(dir, startMs, false);
+    assert.equal(bigSkew?.file, "skew.json");
+    assert.equal(bigSkew?.maxGroupSize, 120);
+    assert.equal(bigSkew?.groupCount, 2);
   });
 });
