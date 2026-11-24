@@ -150,8 +150,12 @@ To eliminate those multi-turn retry loops automatically without mutating prior K
 
 ## 9. Engine & 2-Phase End-to-End Benchmark Results (M1 Max 64 GiB)
 
-| Model | Baseline Time | Optimized Time | Avg / Max Decode | Phase 1 / Phase 2 | Errors | Final Outcome |
+All v2 runs share tightened Splash thinking caps (`low: 640`, `medium: 1152`, `high: 2048`), `isWorkspaceScratchScript` throwaway guards, `repairMalformedJsonString` for stringified `edits`, `auto_critic` Split GDN bypass (`inkling-local`), `pi-verify-ui` + `pi-local --stop-all` Chromium/daemon cleanup (`AB_AFTER_VERIFY=0`, `CHROME_AFTER_VERIFY=0`), and models symlinked on `/Volumes/Extreme SSD` (`--max-cache-disk 0`, no persistent KV cache).
+
+| Model | Baseline | v1 Run | v2 Run (`ed36f00` / `479b3ce`) | v2 Phase 1 / Phase 2 | v2 Edits-Array Errors (Raw Total) | v2 Verification & Cluster Outcome |
 | --- | --- | --- | --- | --- | --- | --- |
-| Ornith 1.5 35B-A3B | `20m 45s` (incomplete) | `36m 19s` | `68.8` / `142.1 tok/s` | `16m 40s` / `19m 39s` | `8` (vs `9`) | `16/16` PASS (`1,157` groups, `1,045` high), `goal_gate` + `auto_critic` PASS |
-| Surogate 3.7 Flash | `29m 28s` | `22m 26s` (`-23.9%`) | `72.2` / `130.9 tok/s` | `8m 14s` / `14m 12s` | `9` (vs `11`) | `16/16` deliverables PASS, `0` compactions up to `80.6K`, `goal_gate` PASS |
-| Inkling 2 Mini | `25m 04s` | `20m 30s` pre-critic (`33m 24s` total) | `47.5` / `65.6 tok/s` | `7m 41s` (`-44.2%`) / `12m 49s` pre-critic | `1` (vs `6`) | Deliverables PASS (`835` groups, `344` high, `maxSize 46`), `pi-verify-ui` PASS, `0` hangs |
+| Ornith 1.5 35B-A3B | `40m 32s` (`20m 45s` incomplete legacy oMLX) | `36m 19s` (`2,179s`, `174t`, `26` raw errs / `15` edits-array) | `52m 48s` (`r4`, pre-fix critic) → **`34m 51s`** (`r5`, `2,091s`, `173t`, `39.8%` reas, `130.9` max tok/s) | `11m 38s` (`698s`) / `23m 13s` (`1,393s`) | **`0`** across `180` calls (`17` total vs `50` in `r4`, `-66.0%`) | `570` groups (`24` high / `5` med / `541` low); `pi-verify-ui` PASS (`29` rendered groups, `0` console/page errs) |
+| Surogate 3.7 Flash | `29m 28s` (`1,768s`, `154t`) | `22m 26s` (`1,346s`, `142t`, `25` raw errs / `8` edits-array) | `77m 59s` (`r2` pre-`479b3ce`, `4,679s`, `64m 28s` pre-critic, `318t`, `134.4` max tok/s) | `27m 06s` (`1,626s`) / `50m 53s` (`3,053s`) | **`0`** across `319` calls (`23` total vs `25` in `r1`) | Best clustering (`114` groups: `29` high / `68` med / `17` low, max `3`); `pi-verify-ui` PASS (`groupsLen: 114`, `qrows: 97`, `0` errs) |
+| Inkling 2 Mini | `25m 04s` (`1,504s`) | `33m 24s` (`2,004s`, `90t`, Split GDN critic) | **`28m 41s`** (`r4`, `1,721s`, `-14.1%` vs v1, `70t`, `14.5%` reas, `76.5` max tok/s) | `6m 20s` (`380s`) / `22m 21s` (`1,341s`) | **`0`** edit errs across `68` calls (`9` total, `0` edits-array) | `auto_critic_skipped_gdn: 1` verified; `1,297` groups (`584` high, max `44`); `pi-verify-ui` PASS (`queueChildren: 628`, `0` errs) |
+
+> Note on `surogate-opt-r2`: Surogate ran on commit `ed36f00` prior to `479b3ce`, where its self-critic emitted a `~13m` false positive against `review.html` inline JSON. Commit `479b3ce` added `isFalsePositiveInlineDataDefect` in [`extensions/local-critic.ts`](extensions/local-critic.ts), which prevented that regression in `ornith-opt-r5`.
