@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import {
+  checkPythonPerfHazards,
   checkSyntaxForFile,
   detectHardcodedSecrets,
   detectPrematureStop,
@@ -281,4 +282,36 @@ test("inspectJsonClusterSkew flags mega-clusters while ignoring healthy cluster 
     assert.equal(bigSkew?.maxGroupSize, 120);
     assert.equal(bigSkew?.groupCount, 2);
   });
+});
+
+test("checkPythonPerfHazards catches unguarded O(K^2) loops and allows guarded ones", () => {
+  const unguarded = [
+    "for key, members in blocks.items():",
+    "    for i in range(len(members)):",
+    "        for j in range(i + 1, len(members)):",
+    "            union(members[i], members[j])",
+    "for root, items in clusters.items():",
+    "    for i in range(len(items)):",
+    "        for j in range(i + 1, len(items)):",
+    "            pair_score(items[i], items[j])",
+  ].join("\n");
+  const hits = checkPythonPerfHazards(unguarded);
+  assert.equal(hits.length, 2);
+  assert.match(hits[0], /unguarded O\(K\^2\) union-find loop over 'members'/);
+  assert.match(hits[1], /unguarded O\(K\^2\) pairwise loop over 'items'/);
+
+  const guarded = [
+    "for key, members in blocks.items():",
+    "    if len(members) > 50:",
+    "        continue",
+    "    for i in range(len(members)):",
+    "        for j in range(i + 1, len(members)):",
+    "            pair_score(members[i], members[j])",
+    "for root, items in clusters.items():",
+    "    items = items[:50]",
+    "    for i in range(len(items)):",
+    "        for j in range(i + 1, len(items)):",
+    "            pair_score(items[i], items[j])",
+  ].join("\n");
+  assert.deepEqual(checkPythonPerfHazards(guarded), []);
 });

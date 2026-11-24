@@ -911,6 +911,59 @@ export function inspectJsonClusterSkew(
   return null;
 }
 
+const OUTER_RANGE_LEN_RE = /^\s*for\s+(\w+)\s+in\s+range\(\s*len\(\s*(\w+)\s*\)\s*\)\s*:/;
+const MAX_PERF_HAZARDS = 4;
+const MAX_PY_PERF_SCAN_BYTES = 256 * 1024;
+
+/** Detect unguarded quadratic nested `range(len(x))` loops in Python files before execution. */
+export function checkPythonPerfHazards(content: string): string[] {
+  const lines = content.split(/\r?\n/);
+  const hazards: string[] = [];
+  const seenLines = new Set<number>();
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const outer = lines[i].match(OUTER_RANGE_LEN_RE);
+    if (!outer) continue;
+    const [, iVar, seqVar] = outer;
+    const innerRe = new RegExp(
+      `^\\s*for\\s+(\\w+)\\s+in\\s+range\\(\\s*${iVar}\\s*\\+\\s*1\\s*,\\s*len\\(\\s*${seqVar}\\s*\\)\\s*\\)\\s*:`,
+    );
+    const maxJ = Math.min(lines.length - 1, i + 6);
+    let innerLine = -1;
+    for (let j = i + 1; j <= maxJ; j += 1) {
+      if (innerRe.test(lines[j])) {
+        innerLine = j;
+        break;
+      }
+    }
+    if (innerLine < 0) continue;
+
+    const guardRe = new RegExp(
+      `len\\(\\s*${seqVar}\\s*\\)\\s*(?:>|>=|<|<=)|\\b${seqVar}\\s*\\[\\s*:\\s*\\d+\\s*\\]|min\\(\\s*(?:\\d+\\s*,\\s*)?len\\(\\s*${seqVar}\\s*\\)`,
+    );
+    const contextStart = Math.max(0, i - 10);
+    const guardWindow = lines.slice(contextStart, i + 1).join("\n");
+    if (guardRe.test(guardWindow)) continue;
+
+    if (seenLines.has(i)) continue;
+    seenLines.add(i);
+
+    const bodyWindow = lines.slice(innerLine + 1, Math.min(lines.length, innerLine + 11)).join("\n");
+    if (/\bunion\w*\s*\(/i.test(bodyWindow)) {
+      hazards.push(
+        `Line ${i + 1}: unguarded O(K^2) union-find loop over '${seqVar}'. Union in O(K) with 'for m in ${seqVar}[1:]: union(${seqVar}[0], m)' and skip blocks with len(${seqVar}) > 50.`,
+      );
+    } else {
+      hazards.push(
+        `Line ${i + 1}: unguarded O(K^2) pairwise loop over '${seqVar}'. Guard block/group size (for example 'if len(${seqVar}) > 50: continue' or slice '${seqVar}[:50]') before nested pair loops.`,
+      );
+    }
+    if (hazards.length >= MAX_PERF_HAZARDS) break;
+  }
+
+  return hazards;
+}
+
 export default function localContextGuardExtension(pi: ExtensionAPI) {
   let consecutiveErrors = 0;
   let lastErrorSignature = "";
@@ -1256,6 +1309,23 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
         } else {
           updateEscalationSignal("clean");
           if (targetPath) fileFailureStreak.delete(targetPath);
+        }
+        if (targetPath && targetPath.toLowerCase().endsWith(".py")) {
+          try {
+            const absPy = path.isAbsolute(targetPath) ? targetPath : path.resolve(ctx.cwd, targetPath);
+            const st = fs.statSync(absPy);
+            if (st.isFile() && st.size > 0 && st.size <= MAX_PY_PERF_SCAN_BYTES) {
+              const hazards = checkPythonPerfHazards(fs.readFileSync(absPy, "utf-8"));
+              if (hazards.length > 0) {
+                appendLocalTrace("local-context-guard", "perf_hazard", { path: targetPath, count: hazards.length });
+                hints.push(
+                  `[ACTION REQUIRED: Static O(K^2) performance hazard(s) in ${targetPath}:\n${hazards.join("\n")}\nFix these guards and remove any low-cardinality union-find keys before running this script.]`,
+                );
+              }
+            }
+          } catch {
+            // Ignore unreadable file errors during static perf checks.
+          }
         }
       }
     } else if (!event.isError) {
