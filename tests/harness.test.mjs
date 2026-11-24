@@ -5,11 +5,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import {
+  checkCliLoopBlock,
+  checkFileChurnBlock,
   checkPythonPerfHazards,
   checkSyntaxForFile,
   detectHardcodedSecrets,
   detectPeriodicToolCycle,
   detectPrematureStop,
+  detectStaleHtmlBundle,
   evaluateFileModifyChurn,
   extractAgentBrowserSessions,
   extractCliCommandFamily,
@@ -17,6 +20,7 @@ import {
   inspectJsonClusterSkew,
   isRootFilesystemFind,
   isTmpScratchScriptWrite,
+  isVerifyHelperFile,
   isWorkspaceScratchScript,
   lintFileIssues,
   normalizeErrorClass,
@@ -31,6 +35,7 @@ import {
   resolveAdaptiveSplashThinkingBudget,
   resolveEscalatedThinkingLevel,
   resolveInklingReasoningEffort,
+  resolveLocalMaxTokens,
   resolveServerOrigin,
   resolveSplashThinkingBudget,
 } from "../extensions/local-omlx-meter.ts";
@@ -698,5 +703,74 @@ test("parseCriticVerdict filters inline/embedded JSON false positives while pres
   assert.deepEqual(parseCriticVerdict(ornithMixed), {
     pass: false,
     defects: ["apply_decisions.py synthesizes decisions deterministically instead of reading decisions.json."],
+  });
+});
+
+test("v4 guardrails: max_tokens cap, hard churn/CLI loop blocks, and stale HTML bundle detection", () => {
+  assert.equal(resolveLocalMaxTokens(32768), 12288);
+  assert.equal(resolveLocalMaxTokens(undefined), 12288);
+  assert.equal(resolveLocalMaxTokens(4096), undefined);
+  assert.equal(resolveLocalMaxTokens(32768, "0"), undefined);
+  assert.equal(resolveLocalMaxTokens(32768, "8192"), 8192);
+
+  assert.equal(isVerifyHelperFile("review_check.js"), true);
+  assert.equal(isVerifyHelperFile("probe.js"), true);
+  assert.equal(isVerifyHelperFile("review_ui.js"), false);
+
+  const churnCounts = new Map([
+    ["review_check.js", 13],
+    ["review_ui.js", 19],
+  ]);
+  assert.equal(checkFileChurnBlock(churnCounts, "review_check.js"), null);
+  churnCounts.set("review_check.js", 14);
+  assert.deepEqual(checkFileChurnBlock(churnCounts, "review_check.js"), {
+    path: "review_check.js",
+    count: 14,
+    limit: 14,
+    isVerifyHelper: true,
+  });
+  assert.equal(checkFileChurnBlock(churnCounts, "review_ui.js"), null);
+  churnCounts.set("review_ui.js", 20);
+  assert.deepEqual(checkFileChurnBlock(churnCounts, "review_ui.js"), {
+    path: "review_ui.js",
+    count: 20,
+    limit: 20,
+    isVerifyHelper: false,
+  });
+
+  const cliCounts = new Map([["pi-verify-ui", 13]]);
+  assert.equal(checkCliLoopBlock(cliCounts, "pi-verify-ui --dom /tmp/a.html"), null);
+  cliCounts.set("pi-verify-ui", 14);
+  assert.deepEqual(checkCliLoopBlock(cliCounts, "pi-verify-ui /tmp/a.html"), {
+    family: "pi-verify-ui",
+    count: 14,
+    limit: 14,
+  });
+  assert.equal(checkCliLoopBlock(cliCounts, "python3 app.py"), null);
+
+  withTempDir((dir) => {
+    const htmlPath = path.join(dir, "review.html");
+    const jsPath = path.join(dir, "review_ui.js");
+    fs.writeFileSync(htmlPath, "<html><body>v1</body></html>");
+    fs.writeFileSync(jsPath, "console.log('v2');");
+    const now = Date.now() / 1000;
+    fs.utimesSync(htmlPath, now - 10, now - 10);
+    fs.utimesSync(jsPath, now, now);
+    const srcMtime = fs.statSync(jsPath).mtimeMs;
+
+    assert.deepEqual(
+      detectStaleHtmlBundle('pi-verify-ui "$PWD/review.html"', dir, { file: "review_ui.js", mtimeMs: srcMtime }),
+      { htmlFile: "review.html", sourceFile: "review_ui.js" },
+    );
+    assert.equal(
+      detectStaleHtmlBundle('pi-verify-ui "$PWD/review.html"', dir, { file: "review.html", mtimeMs: srcMtime }),
+      null,
+    );
+
+    fs.utimesSync(htmlPath, now + 5, now + 5);
+    assert.equal(
+      detectStaleHtmlBundle('pi-verify-ui "$PWD/review.html"', dir, { file: "review_ui.js", mtimeMs: srcMtime }),
+      null,
+    );
   });
 });

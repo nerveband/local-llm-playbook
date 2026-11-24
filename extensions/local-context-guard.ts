@@ -331,6 +331,18 @@ export function extractAgentBrowserSessions(cmd: string): { opened: string[]; cl
   return { opened, closed };
 }
 
+const HARD_FILE_CHURN_TEST = Number(process.env.PI_LOCAL_HARD_CHURN_TEST || 14);
+const HARD_FILE_CHURN_ANY = Number(process.env.PI_LOCAL_HARD_CHURN_ANY || 20);
+const HARD_CLI_LOOP_LIMIT = Number(process.env.PI_LOCAL_HARD_CLI_LOOP || 14);
+const VERIFY_HELPER_FILE_RE =
+  /(?:^|\/)(?:(?:test|verify|check|probe|geo_check|prev_check)[_-][a-z0-9_.-]*|[a-z0-9_.-]*(?:_check|_test|_verify|_probe|_harness)|probe|report)\.(?:js|mjs|cjs|py|ts)$/i;
+
+/** Identify test/verification helper scripts where repeated micro-edits signal a loop. */
+export function isVerifyHelperFile(rawPath: string): boolean {
+  const norm = String(rawPath || "").trim().replace(/^\.\//, "");
+  return Boolean(norm && VERIFY_HELPER_FILE_RE.test(norm));
+}
+
 /** Track repeated write/edit churn against a single file (filename-agnostic). */
 export function evaluateFileModifyChurn(
   counts: Map<string, number>,
@@ -342,6 +354,62 @@ export function evaluateFileModifyChurn(
   counts.set(norm, count);
   const shouldNudge = count >= 8 && (count - 8) % 4 === 0;
   return { path: norm, count, shouldNudge };
+}
+
+/** Hard-block excessive micro-iteration on a single file (stricter for test/probe helpers). */
+export function checkFileChurnBlock(
+  counts: Map<string, number>,
+  rawPath: string,
+): { path: string; count: number; limit: number; isVerifyHelper: boolean } | null {
+  const norm = String(rawPath || "").trim().replace(/^\.\//, "");
+  if (!norm) return null;
+  const count = counts.get(norm) ?? 0;
+  const isHelper = isVerifyHelperFile(norm);
+  const limit = isHelper ? HARD_FILE_CHURN_TEST : HARD_FILE_CHURN_ANY;
+  if (limit > 0 && count >= limit) {
+    return { path: norm, count, limit, isVerifyHelper: isHelper };
+  }
+  return null;
+}
+
+/** Hard-block repeated turn-by-turn invocations of the same CLI family (e.g. pi-verify-ui). */
+export function checkCliLoopBlock(
+  counts: Map<string, number>,
+  cmd: string,
+): { family: string; count: number; limit: number } | null {
+  const family = extractCliCommandFamily(cmd);
+  if (!family || HARD_CLI_LOOP_LIMIT <= 0) return null;
+  const count = counts.get(family) ?? 0;
+  if (count >= HARD_CLI_LOOP_LIMIT) {
+    return { family, count, limit: HARD_CLI_LOOP_LIMIT };
+  }
+  return null;
+}
+
+/** Warn when pi-verify-ui checks an HTML bundle older than the last edited JS/CSS/HTML source. */
+export function detectStaleHtmlBundle(
+  cmd: string,
+  cwd: string,
+  lastSourceEdit: { file: string; mtimeMs: number } | null,
+): { htmlFile: string; sourceFile: string } | null {
+  if (!cmd || !/\bpi-verify-ui\b/.test(cmd) || !lastSourceEdit) return null;
+  const match = cmd.match(/(?:^|\s)(?:"([^"\s]+\.html?)"|'([^'\s]+\.html?)'|([^\s"';&|]+\.html?))/i);
+  const rawHtml = (match?.[1] ?? match?.[2] ?? match?.[3] ?? "").trim();
+  if (!rawHtml) return null;
+  const expanded = rawHtml.replace(/^\$\{?PWD\}?\//, `${cwd}/`);
+  const absHtml = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
+  const htmlBase = path.basename(absHtml);
+  const srcBase = path.basename(lastSourceEdit.file);
+  if (htmlBase === srcBase) return null;
+  try {
+    const st = fs.statSync(absHtml);
+    if (st.mtimeMs + 100 < lastSourceEdit.mtimeMs) {
+      return { htmlFile: htmlBase, sourceFile: srcBase };
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 /** Classify repeated turn-by-turn external CLI families that should be batched. */
@@ -1358,6 +1426,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
   let piVerifyUiRan = false;
   let hadToolCallsInSession = false;
   let consecutivePrematureRetries = 0;
+  let lastUiSourceEdit: { file: string; mtimeMs: number } | null = null;
   let lastAssistantSnapshot: Omit<AssistantTurnSnapshot, "hadToolCallsInSession"> | null = null;
   const bashStartTimes = new Map<string, number>();
   const baselineLintCounts = new Map<string, number>();
@@ -1384,6 +1453,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     consecutiveShortBash = 0;
     piVerifyUiRan = false;
     consecutivePrematureRetries = 0;
+    lastUiSourceEdit = null;
     lastAssistantSnapshot = null;
     bashStartTimes.clear();
     baselineLintCounts.clear();
@@ -1505,8 +1575,30 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       }
 
       const targetPath = String(input?.path ?? input?.file_path ?? "");
+      const churnBlock = checkFileChurnBlock(fileModifyCounts, targetPath);
+      if (churnBlock) {
+        appendLocalTrace("local-context-guard", "file_churn_blocked", churnBlock);
+        return {
+          block: true,
+          reason: churnBlock.isVerifyHelper
+            ? `Churn guard: modified verification helper '${path.basename(churnBlock.path)}' ${churnBlock.count} times (limit ${churnBlock.limit}). Stop rewriting the test script: read and fix the underlying app/UI deliverable directly, or move to the next deliverable.`
+            : `Churn guard: modified '${path.basename(churnBlock.path)}' ${churnBlock.count} times in one session (limit ${churnBlock.limit}). Step back, record status in notes.md, and advance to the next deliverable or handoff.`,
+        };
+      }
       if (targetPath && ctx?.cwd) {
         baselineLintCounts.set(callId, lintFileIssues(targetPath, ctx.cwd).lintErrors.length);
+      }
+    }
+
+    if (toolName === "bash") {
+      const cmd = typeof input?.command === "string" ? input.command : "";
+      const cliBlock = checkCliLoopBlock(cliFamilyCounts, cmd);
+      if (cliBlock) {
+        appendLocalTrace("local-context-guard", "cli_loop_blocked", cliBlock);
+        return {
+          block: true,
+          reason: `CLI loop guard: called '${cliBlock.family}' ${cliBlock.count} times in this session (limit ${cliBlock.limit}). Stop turn-by-turn UI/CLI polling; read/fix the source deliverable directly or move to the next deliverable.`,
+        };
       }
     }
     const sig = summarizeCallSignature(toolName, input);
@@ -1803,6 +1895,24 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
           updateEscalationSignal("clean");
           if (targetPath) fileFailureStreak.delete(targetPath);
         }
+        if (targetPath && /\.(?:css|html?|js|mjs|cjs|ts)$/i.test(targetPath) && !isVerifyHelperFile(targetPath)) {
+          try {
+            const absTarget = resolveWorkspacePath(targetPath, ctx.cwd);
+            if (absTarget && fs.existsSync(absTarget)) {
+              lastUiSourceEdit = {
+                file: path.basename(absTarget),
+                mtimeMs: fs.statSync(absTarget).mtimeMs,
+              };
+            }
+          } catch {
+            // Ignore stat failures on transient paths.
+          }
+          for (const trackedPath of Array.from(fileModifyCounts.keys())) {
+            if (isVerifyHelperFile(trackedPath)) {
+              fileModifyCounts.delete(trackedPath);
+            }
+          }
+        }
         if (targetPath && targetPath.toLowerCase().endsWith(".py")) {
           try {
             const absPy = path.isAbsolute(targetPath) ? targetPath : path.resolve(ctx.cwd, targetPath);
@@ -1869,6 +1979,13 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
 
       const cliFamily = extractCliCommandFamily(cmd);
       if (cliFamily) {
+        const staleBundle = detectStaleHtmlBundle(cmd, ctx.cwd, lastUiSourceEdit);
+        if (staleBundle) {
+          appendLocalTrace("local-context-guard", "stale_bundle_hint", staleBundle);
+          hints.push(
+            `[ACTION REQUIRED: Stale bundle warning: ${staleBundle.sourceFile} was modified more recently than ${staleBundle.htmlFile}. Rebuild ${staleBundle.htmlFile} before trusting UI verification results.]`,
+          );
+        }
         const famCount = (cliFamilyCounts.get(cliFamily) ?? 0) + 1;
         cliFamilyCounts.set(cliFamily, famCount);
         if (famCount >= 6 && (famCount - 6) % 4 === 0) {

@@ -162,6 +162,31 @@ export function resolveAdaptiveSplashThinkingBudget(
   return { budget: nextBudget, escalated: nextBudget > base, steps };
 }
 
+/** Cap per-turn output tokens for local models to limit generation runaway blast radius. */
+export function resolveLocalMaxTokens(
+  requestedMaxTokens: unknown,
+  envCap?: string,
+): number | undefined {
+  const raw = (envCap !== undefined ? envCap : process.env.PI_LOCAL_MAX_TURN_TOKENS ?? "").trim().toLowerCase();
+  if (raw === "0" || raw === "off" || raw === "false") {
+    return undefined;
+  }
+  const parsed = raw ? Number(raw) : 12288;
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return undefined;
+  }
+  const cap = Math.max(2048, Math.floor(parsed));
+  if (
+    typeof requestedMaxTokens === "number" &&
+    Number.isFinite(requestedMaxTokens) &&
+    requestedMaxTokens > 0 &&
+    requestedMaxTokens <= cap
+  ) {
+    return undefined;
+  }
+  return cap;
+}
+
 export function resolveServerOrigin(model: ExtensionContext["model"]): string | null {
   const baseUrl = String((model as { baseUrl?: string } | undefined)?.baseUrl || "");
   if (baseUrl) {
@@ -594,6 +619,20 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
       }
     }
 
+    if (nextPayload.max_completion_tokens !== undefined) {
+      const capped = resolveLocalMaxTokens(nextPayload.max_completion_tokens);
+      if (capped !== undefined) {
+        nextPayload.max_completion_tokens = capped;
+        changed = true;
+      }
+    } else {
+      const capped = resolveLocalMaxTokens(nextPayload.max_tokens);
+      if (capped !== undefined) {
+        nextPayload.max_tokens = capped;
+        changed = true;
+      }
+    }
+
     return changed ? nextPayload : undefined;
   });
 
@@ -743,6 +782,7 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
     appendLocalTrace("local-omlx-meter", "turn_end", {
       provider: ctx.model?.provider,
       model: ctx.model?.id,
+      stopReason: (msg as { stopReason?: string }).stopReason ?? null,
       turnSec: Number(turnSec.toFixed(2)),
       ttftSec: ttftSec !== null ? Number(ttftSec.toFixed(2)) : null,
       genTps: finalTps !== null && Number.isFinite(finalTps) ? Number(finalTps.toFixed(1)) : null,
