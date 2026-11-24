@@ -8,6 +8,7 @@ import {
   checkPythonPerfHazards,
   checkSyntaxForFile,
   detectHardcodedSecrets,
+  detectPeriodicToolCycle,
   detectPrematureStop,
   evaluateFileModifyChurn,
   extractAgentBrowserSessions,
@@ -671,6 +672,11 @@ test("empirical microtest fixes: happy-dom textContent=0, auto-invoke eval funct
     assert.equal(cdpStdin.ok, true);
     assert.equal(cdpStdin.custom?.viaStdin, "tpl_2");
   });
+
+  assert.deepEqual(detectPeriodicToolCycle(["a", "b", "a", "b"]), { period: 2, repeats: 2 });
+  assert.deepEqual(detectPeriodicToolCycle(["x", "a", "b", "c", "a", "b", "c"]), { period: 3, repeats: 2 });
+  assert.deepEqual(detectPeriodicToolCycle(["a", "b", "c", "a", "b", "c", "a", "b", "c"]), { period: 3, repeats: 3 });
+  assert.equal(detectPeriodicToolCycle(["a", "b", "c", "a", "b", "d"]), null);
 });
 
 test("parseCriticVerdict filters inline/embedded JSON false positives while preserving real defects", () => {

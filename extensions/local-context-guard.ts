@@ -246,7 +246,32 @@ function isShellReadProbe(toolName: string, input: Record<string, unknown> | und
   if (!cmd) return false;
   if (isExplicitLineSliceCommand(toolName, input)) return false;
   if (/(?:^|\s)(?:\.\/)?notes\.md(?:\s|$)/.test(cmd)) return false;
-  return /^\s*(?:cat|head|tail|sed)\b/.test(cmd);
+  return /^\s*(?:cat|head|tail|sed|nl)\b/.test(cmd) || /\bgrep\b[^\n|]*\|\s*(?:sed|head|tail)\b/.test(cmd);
+}
+
+/** Detect repeating 2-to-4 step periodic tool-call cycles (e.g. A->B->C->A->B->C). */
+export function detectPeriodicToolCycle(
+  history: readonly string[],
+): { period: number; repeats: number } | null {
+  for (const period of [2, 3, 4]) {
+    if (history.length < period * 2) continue;
+    let repeats = 1;
+    for (let offset = period; offset + period <= history.length; offset += period) {
+      let match = true;
+      for (let k = 0; k < period; k += 1) {
+        if (history[history.length - period + k] !== history[history.length - offset - period + k]) {
+          match = false;
+          break;
+        }
+      }
+      if (!match) break;
+      repeats += 1;
+    }
+    if (repeats >= 2) {
+      return { period, repeats };
+    }
+  }
+  return null;
 }
 
 const MAX_REPAIR_FILE_BYTES = 2_097_152;
@@ -1341,6 +1366,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
   const fileModifyCounts = new Map<string, number>();
   const cliFamilyCounts = new Map<string, number>();
   const errorClassCounts = new Map<string, number>();
+  const recentCallSignatures: string[] = [];
   const workspaceScratchFiles = new Set<string>();
   const openBrowserSessions = new Set<string>();
 
@@ -1349,6 +1375,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     lastErrorSignature = "";
     lastCallSignature = "";
     consecutiveSameCall = 0;
+    recentCallSignatures.length = 0;
     consecutivePythonProbes = 0;
     consecutiveShellReadProbes = 0;
     consecutiveVerifyScriptErrors = 0;
@@ -1488,6 +1515,22 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     } else {
       lastCallSignature = sig;
       consecutiveSameCall = 1;
+    }
+    recentCallSignatures.push(sig);
+    if (recentCallSignatures.length > 24) {
+      recentCallSignatures.shift();
+    }
+    const cycle = detectPeriodicToolCycle(recentCallSignatures);
+    if (cycle) {
+      appendLocalTrace("local-context-guard", "cycle_loop_blocked", {
+        tool: toolName,
+        period: cycle.period,
+        repeats: cycle.repeats,
+      });
+      return {
+        block: true,
+        reason: `Loop guard: detected repeating ${cycle.period}-step tool call cycle (${cycle.repeats}x identical sequence). Stop repeating these commands; act on the output you already have using read(path, offset, limit), edit, or write, or advance to the next step.`,
+      };
     }
 
     if (isTmpScratchScriptWrite(toolName, input)) {
