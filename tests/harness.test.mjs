@@ -31,6 +31,7 @@ import {
 import { evaluateVerifySpec } from "../extensions/local-goal-gate.ts";
 import { parseCriticVerdict, collectCriticBundle, shouldSkipAutoCriticForProvider } from "../extensions/local-critic.ts";
 import {
+  detectThinkingLeak,
   isSplashProvider,
   resolveAdaptiveSplashThinkingBudget,
   resolveEscalatedThinkingLevel,
@@ -38,6 +39,7 @@ import {
   resolveLocalMaxTokens,
   resolveServerOrigin,
   resolveSplashThinkingBudget,
+  shouldInjectExplicitThinkingOff,
 } from "../extensions/local-omlx-meter.ts";
 import { appendLocalTrace } from "../extensions/local-trace.ts";
 
@@ -773,4 +775,30 @@ test("v4 guardrails: max_tokens cap, hard churn/CLI loop blocks, and stale HTML 
       null,
     );
   });
+});
+
+test("thinking-off safety: explicit enable_thinking=false injection and output leak detection", () => {
+  assert.equal(shouldInjectExplicitThinkingOff("omlx", "off", {}), true);
+  assert.equal(shouldInjectExplicitThinkingOff("surogate-local", "off", {}), true);
+  assert.equal(
+    shouldInjectExplicitThinkingOff("surogate-local", "off", { chat_template_kwargs: { enable_thinking: false } }),
+    false,
+  );
+  assert.equal(shouldInjectExplicitThinkingOff("inkling-local", "off", {}), false);
+  assert.equal(shouldInjectExplicitThinkingOff("omlx", "low", {}), false);
+
+  assert.equal(
+    detectThinkingLeak("low", { content: [{ type: "thinking", thinking: "plan" }] }, 120).leaked,
+    false,
+  );
+  assert.equal(detectThinkingLeak("off", { content: [{ type: "text", text: "42" }] }, 0).leaked, false);
+  assert.equal(detectThinkingLeak("off", { content: [{ type: "text", text: "42" }] }, 18).leaked, true);
+  assert.equal(
+    detectThinkingLeak("off", { content: [{ type: "thinking", thinking: "step 1" }] }, 0).leaked,
+    true,
+  );
+  assert.equal(
+    detectThinkingLeak("off", { content: [{ type: "text", text: "<think>hmm</think>42" }] }, 0).leaked,
+    true,
+  );
 });

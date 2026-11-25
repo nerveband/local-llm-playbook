@@ -187,6 +187,65 @@ export function resolveLocalMaxTokens(
   return cap;
 }
 
+/** Force explicit enable_thinking: false for non-Inkling local models when thinking is off. */
+export function shouldInjectExplicitThinkingOff(
+  provider: string,
+  level: string | undefined,
+  payload: Record<string, unknown>,
+): boolean {
+  if (String(level || "").trim().toLowerCase() !== "off") return false;
+  if (String(provider || "").trim().toLowerCase() === "inkling-local") return false;
+  const rawKwargs =
+    payload.chat_template_kwargs && typeof payload.chat_template_kwargs === "object"
+      ? (payload.chat_template_kwargs as Record<string, unknown>)
+      : undefined;
+  if (rawKwargs?.enable_thinking !== undefined || payload.enable_thinking !== undefined) {
+    return false;
+  }
+  return true;
+}
+
+/** Verify actual assistant output did not emit thinking tokens/tags when thinking is off. */
+export function detectThinkingLeak(
+  requestedLevel: string | undefined,
+  msg: { content?: unknown[]; usage?: { reasoning?: number } } | undefined,
+  serverReasoningTokens?: number,
+): { leaked: boolean; reasoningTokens: number; hasThinkingBlock: boolean; hasThinkTag: boolean } {
+  if (String(requestedLevel || "").trim().toLowerCase() !== "off") {
+    return { leaked: false, reasoningTokens: 0, hasThinkingBlock: false, hasThinkTag: false };
+  }
+  const serverTok =
+    typeof serverReasoningTokens === "number" && Number.isFinite(serverReasoningTokens)
+      ? serverReasoningTokens
+      : 0;
+  const usageTok =
+    typeof msg?.usage?.reasoning === "number" && Number.isFinite(msg.usage.reasoning)
+      ? msg.usage.reasoning
+      : 0;
+  const reasoningTokens = Math.max(serverTok, usageTok);
+  let hasThinkingBlock = false;
+  let hasThinkTag = false;
+  for (const part of Array.isArray(msg?.content) ? msg.content : []) {
+    if (!part || typeof part !== "object") continue;
+    const item = part as { type?: unknown; thinking?: unknown; text?: unknown };
+    if (item.type === "thinking" && typeof item.thinking === "string" && item.thinking.trim().length > 0) {
+      hasThinkingBlock = true;
+    } else if (
+      item.type === "text" &&
+      typeof item.text === "string" &&
+      /<(?:think|\/think|\|content_thinking\|)>/i.test(item.text)
+    ) {
+      hasThinkTag = true;
+    }
+  }
+  return {
+    leaked: reasoningTokens > 0 || hasThinkingBlock || hasThinkTag,
+    reasoningTokens,
+    hasThinkingBlock,
+    hasThinkTag,
+  };
+}
+
 export function resolveServerOrigin(model: ExtensionContext["model"]): string | null {
   const baseUrl = String((model as { baseUrl?: string } | undefined)?.baseUrl || "");
   if (baseUrl) {
@@ -303,6 +362,7 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
   let lastCtx: ExtensionContext | null = null;
   let ticker: ReturnType<typeof setInterval> | null = null;
   let statusEndpointUnsupported = false;
+  let warnedThinkingLeak = false;
   let consecutiveThinkingCapHits = 0;
   let lastSentThinkingBudget: number | null = null;
 
@@ -497,6 +557,7 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
     lastCompletedSummary = null;
     latestStatusSnapshot = null;
     statusEndpointUnsupported = false;
+    warnedThinkingLeak = false;
     consecutiveThinkingCapHits = 0;
     lastSentThinkingBudget = null;
     safeSetStatus(ctx, "⚡ --");
@@ -506,6 +567,7 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
     lastCtx = ctx;
     latestStatusSnapshot = null;
     statusEndpointUnsupported = false;
+    warnedThinkingLeak = false;
     consecutiveThinkingCapHits = 0;
     lastSentThinkingBudget = null;
   });
@@ -519,6 +581,22 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
     const provider = String(ctx.model?.provider || "").toLowerCase();
     const nextPayload: Record<string, unknown> = { ...payload };
     let changed = false;
+    const currentLevel =
+      typeof (pi as { getThinkingLevel?: () => string }).getThinkingLevel === "function"
+        ? (pi as { getThinkingLevel: () => string }).getThinkingLevel()
+        : undefined;
+
+    if (shouldInjectExplicitThinkingOff(provider, currentLevel, nextPayload)) {
+      const rawKwargs =
+        nextPayload.chat_template_kwargs && typeof nextPayload.chat_template_kwargs === "object"
+          ? (nextPayload.chat_template_kwargs as Record<string, unknown>)
+          : {};
+      nextPayload.chat_template_kwargs = {
+        ...rawKwargs,
+        enable_thinking: false,
+      };
+      changed = true;
+    }
 
     if (
       provider === "surogate-local" ||
@@ -764,6 +842,32 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
       outTok,
       serverStats?.prefillTps,
     );
+    const currentLevel =
+      typeof (pi as { getThinkingLevel?: () => string }).getThinkingLevel === "function"
+        ? (pi as { getThinkingLevel: () => string }).getThinkingLevel()
+        : undefined;
+    const leak = detectThinkingLeak(
+      currentLevel,
+      msg as { content?: unknown[]; usage?: { reasoning?: number } },
+      serverStats?.reasoningTokens,
+    );
+    if (leak.leaked) {
+      lastCompletedSummary = `${lastCompletedSummary} · ⚠ think-leak`;
+      if (!warnedThinkingLeak) {
+        warnedThinkingLeak = true;
+        ctx.ui?.notify?.(
+          "Thinking leak detected: model emitted reasoning tokens while thinking is set to off.",
+          "warning",
+        );
+      }
+      appendLocalTrace("local-omlx-meter", "thinking_leak", {
+        provider: ctx.model?.provider,
+        model: ctx.model?.id,
+        reasoningTokens: leak.reasoningTokens,
+        hasThinkingBlock: leak.hasThinkingBlock,
+        hasThinkTag: leak.hasThinkTag,
+      });
+    }
     safeSetStatus(ctx, lastCompletedSummary);
 
     const providerLower = String(ctx.model?.provider || "").toLowerCase();
@@ -791,6 +895,7 @@ export default function localOmlxMeterExtension(pi: ExtensionAPI) {
       cachedTokens: serverStats?.cachedTokens ?? null,
       outputTokens: outTok,
       reasoningTokens: serverStats?.reasoningTokens ?? null,
+      thinkingLeak: leak.leaked,
       thinkingBudget: lastSentThinkingBudget,
       thinkingCapStreak: consecutiveThinkingCapHits,
     });
