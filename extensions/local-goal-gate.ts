@@ -23,6 +23,17 @@ export interface GoalState {
 const DEFAULT_MAX_RETRIES = Number(process.env.PI_LOCAL_GOAL_MAX_RETRIES || 3);
 const VERIFY_SPEC_FILE = ".pi-verify.json";
 
+/** Skip autonomous Goal Gate retries after user/circuit abort or cleanly staged handoff. */
+export function shouldSkipGoalGateRetry(opts: {
+  stopReason?: string;
+  circuitBreakerTripped?: boolean;
+  hasHandoff?: boolean;
+}): boolean {
+  if (opts.hasHandoff) return true;
+  if (opts.circuitBreakerTripped) return true;
+  return String(opts.stopReason || "").trim().toLowerCase() === "aborted";
+}
+
 function resolveSafePath(cwd: string, rel: string): string {
   return path.isAbsolute(rel) ? rel : path.resolve(cwd, rel);
 }
@@ -141,6 +152,8 @@ export default function localGoalGateExtension(pi: ExtensionAPI) {
     lastFailures: [],
   };
 
+  let lastStopReason: string | undefined;
+
   function updateUiPill(ctx: ExtensionContext | undefined): void {
     if (!ctx?.ui?.setStatus) return;
     if (state.status === "active") {
@@ -159,14 +172,23 @@ export default function localGoalGateExtension(pi: ExtensionAPI) {
     state.objective = "";
     state.continuationCount = 0;
     state.lastFailures = [];
+    lastStopReason = undefined;
     updateUiPill(ctx);
   });
 
   pi.on("input", (event, ctx) => {
+    lastStopReason = undefined;
     if (event.source === "interactive" && !event.text.trim().startsWith("/goal")) {
       state.continuationCount = 0;
       state.lastFailures = [];
       updateUiPill(ctx);
+    }
+  });
+
+  pi.on("message_end", (event) => {
+    const msg = event.message as { role?: string; stopReason?: string } | undefined;
+    if (msg?.role === "assistant") {
+      lastStopReason = msg.stopReason;
     }
   });
 
@@ -260,7 +282,19 @@ export default function localGoalGateExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", (_event, ctx) => {
-    if (fs.existsSync(path.join(ctx.cwd, ".pi-handoff.md"))) return;
+    const hasHandoff = fs.existsSync(path.join(ctx.cwd, ".pi-handoff.md"));
+    const circuitBreakerTripped = Boolean(
+      (globalThis as typeof globalThis & { __piLocalCircuitBreakerTripped?: boolean })
+        .__piLocalCircuitBreakerTripped,
+    );
+    if (shouldSkipGoalGateRetry({ stopReason: lastStopReason, circuitBreakerTripped, hasHandoff })) {
+      appendLocalTrace("local-goal-gate", "goal_gate_skipped", {
+        stopReason: lastStopReason ?? null,
+        circuitBreakerTripped,
+        hasHandoff,
+      });
+      return;
+    }
 
     const spec = loadVerifySpec(ctx.cwd);
     const hasSpec = spec !== null;

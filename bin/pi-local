@@ -22,6 +22,8 @@ USE_CONTEXT_GUARD=1
 USE_GOAL_GATE=1
 USE_CRITIC=1
 USE_HASHLINE="auto"
+USE_BETTER_EDIT=0
+USE_CODE_TOOL=0
 USE_CODEMODE=0
 USE_PREFLIGHT=0
 AUTO_CRITIC=0
@@ -53,7 +55,9 @@ Options:
   --no-think       Shortcut for --think off
   --hashline       Enable pi-hashline-edit read/edit override (auto-enabled for Surogate & Ornith)
   --no-hashline    Disable pi-hashline-edit even for Surogate & Ornith
-  --codemode       Keep Pi's codemode tool enabled (helpful for Python-first models like Inkling)
+  --better-edit    Use pi-better-edit (4-char hash anchors + persistent undo) instead of standard/hashline edit
+  --code-tool      Enable lean pi-code-tool sandboxed Python tool (bridges Pi tools, auto-approves edits)
+  --codemode       Keep Pi's codemode tool enabled (heavy schema; prefer --code-tool for local models)
   --preflight      Inject Turn-0 zero-PII workspace/CSV schema snapshot into static prompt
   --auto-critic    Run one zero-swap fresh-context critic pass before final completion
   --adaptive-think Step thinking tier up +1 after 2 consecutive errors and down after 2 clean turns
@@ -84,6 +88,7 @@ Examples:
 EOF
 }
 
+PASS_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --inkling)
@@ -147,6 +152,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-hashline)
       USE_HASHLINE="0"
+      shift
+      ;;
+    --better-edit)
+      USE_BETTER_EDIT=1
+      shift
+      ;;
+    --code-tool)
+      USE_CODE_TOOL=1
       shift
       ;;
     --codemode)
@@ -226,10 +239,12 @@ while [[ $# -gt 0 ]]; do
       break
       ;;
     *)
-      break
+      PASS_ARGS+=("$1")
+      shift
       ;;
   esac
 done
+set -- "${PASS_ARGS[@]}" "$@"
 
 IS_PRINT_MODE=0
 for arg in "$@"; do
@@ -686,13 +701,30 @@ add_ext() {
 }
 
 HASHLINE_ACTIVE=0
-if [[ "$USE_HASHLINE" == "1" ]]; then
-  HASHLINE_ACTIVE=1
-elif [[ "$USE_HASHLINE" == "auto" ]] && [[ "$MODEL" == surogate-local/* || "$MODEL" == ornith-splash/* || "$MODEL" == omlx-local/* ]]; then
-  HASHLINE_ACTIVE=1
+EDIT_MODE="standard"
+if [[ "$USE_BETTER_EDIT" == "1" ]]; then
+  EDIT_MODE="better-edit"
+  add_ext "$LOCAL_EXT_ROOT/pi-better-edit/dist/index.js"
+else
+  if [[ "$USE_HASHLINE" == "1" ]]; then
+    HASHLINE_ACTIVE=1
+  elif [[ "$USE_HASHLINE" == "auto" ]] && [[ "$MODEL" == surogate-local/* || "$MODEL" == ornith-splash/* || "$MODEL" == omlx-local/* ]]; then
+    HASHLINE_ACTIVE=1
+  fi
+  if [[ "$HASHLINE_ACTIVE" == "1" ]]; then
+    EDIT_MODE="hashline"
+    add_ext "$LOCAL_EXT_ROOT/pi-hashline-edit/index.ts"
+  fi
 fi
-if [[ "$HASHLINE_ACTIVE" == "1" ]]; then
-  add_ext "$LOCAL_EXT_ROOT/pi-hashline-edit/index.ts"
+export PI_LOCAL_HASHLINE="$HASHLINE_ACTIVE"
+export PI_LOCAL_EDIT_MODE="$EDIT_MODE"
+
+if [[ "$USE_CODE_TOOL" == "1" ]]; then
+  add_ext "$REPO_DIR/extensions/local-code-tool.ts"
+  export PI_LOCAL_CODE_TOOL=1
+fi
+if [[ "${HERDR_ENV:-}" == "1" ]] && [[ -f "$HOME/.pi/agent/extensions/herdr-agent-state.ts" ]]; then
+  add_ext "$HOME/.pi/agent/extensions/herdr-agent-state.ts"
 fi
 
 if [[ "$USE_PHASE_TOOL" == "1" ]]; then

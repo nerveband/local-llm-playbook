@@ -50,6 +50,8 @@ Picking `1`, `2`, or `3` automatically quits any competing model server if activ
 # Launch directly without showing the picker menu
 pi-local --inkling
 pi-local --inkling --bare --think low
+pi-local --inkling --code-tool
+pi-local --inkling --better-edit
 pi-local --ornith
 pi-local --ornith --no-think
 pi-local --surogate
@@ -88,16 +90,22 @@ pi-local --surogate --print-cmd
 - [`extensions/local-critic.ts`](extensions/local-critic.ts): Fresh-context `/critic` command and `--auto-critic` end-of-task review with balanced workspace inventory.
 - [`extensions/local-trace.ts`](extensions/local-trace.ts): Unified structured JSONL event tracer (`PI_LOCAL_TRACE_FILE` / `--trace`).
 - [`extensions/local-phase-handoff.ts`](extensions/local-phase-handoff.ts): Self-triggered `phase_handoff` tool, `32K`-token speed notice, and `/next-phase` session switcher.
+- [`extensions/local-code-tool.ts`](extensions/local-code-tool.ts): Lean opt-in wrapper around `pi-code-tool@0.6.2` (`--code-tool`) providing a sandboxed Python `code` tool via `@pydantic/monty` with bridged Pi tools and auto-approved edits.
 - [`configs/oxlintrc-local.json`](configs/oxlintrc-local.json): Fast `oxlint` ruleset with browser + node environments enabled for standalone UI/extension checks.
 - [`configs/pi-models-local.example.json`](configs/pi-models-local.example.json): Local provider definitions (`inkling-local` on `18089`, `surogate-local` on `18091`, `ornith-splash` on `18092`, legacy `omlx-local` on `8000`).
 - [`configs/pi-settings-local.example.json`](configs/pi-settings-local.example.json): Per-model thinking and compaction overrides for Inkling, Ornith Splash, and Surogate Splash (`reserveTokens: 36864`, `keepRecentTokens: 12000`).
 - [`tests/harness.test.mjs`](tests/harness.test.mjs): Node unit & regression suite (`node --test tests/harness.test.mjs`).
-- [`scripts/install-local-extensions.sh`](scripts/install-local-extensions.sh): Installs `pi-handoff` and `pi-subagents` into `~/.local/share/pi-local-extensions` and symlinks CLI helpers into `~/.local/bin`.
+- [`scripts/install-local-extensions.sh`](scripts/install-local-extensions.sh): Installs `pi-handoff`, `pi-subagents`, `pi-hashline-edit@0.9.0`, `pi-better-edit@2.21.0`, `pi-code-tool@0.6.2`, and `happy-dom` into `~/.local/share/pi-local-extensions` and symlinks CLI helpers into `~/.local/bin`.
 - [`prompts/local-lean-rules.md`](prompts/local-lean-rules.md): Short system prompt rules covering disk memory (`notes.md`), batched schema checks, `pi-verify-ui`, differential lint, blocking-vs-scoring separation, and `O(K)` union-find guards.
 - [`BEST_PRACTICES.md`](BEST_PRACTICES.md): Engine A/B micro-benchmarks, Before-vs-After 3-model benchmarks, memory balance, KV prefix caching, and Split GDN `--slots 1` tradeoffs.
 - [`PROMPTS.md`](PROMPTS.md): Copy-paste prompts for large tabular datasets, refactors, mid-session nudges, and phase transitions.
 
 ## Changelog
+
+- `2026-11-25` (v5 Inkling harness hardening, Python edit tooling, & package integration):
+  - **New integrations in `bin/pi-local` & `extensions/local-code-tool.ts`:** Fixed positional flag parsing (`PASS_ARGS`) so `pi-local` flags work before or after `--no-session`/`-p`, added `--better-edit` (`pi-better-edit@2.21.0`, `4`-char anchored edits + persistent `undo`), upgraded `pi-hashline-edit` to `0.9.0`, added `--code-tool` (`pi-code-tool@0.6.2` / `@pydantic/monty` lean `code` wrapper in `extensions/local-code-tool.ts`), and auto-loaded `~/.pi/agent/extensions/herdr-agent-state.ts` whenever `HERDR_ENV=1`.
+  - **Thinking-off safety & truncation/loop guards:** Added explicit `chat_template_kwargs.enable_thinking = false` (`shouldInjectExplicitThinkingOff`) and post-turn leak detection (`detectThinkingLeak`) in [`extensions/local-omlx-meter.ts`](extensions/local-omlx-meter.ts). Updated [`extensions/local-context-guard.ts`](extensions/local-context-guard.ts) with dedicated `stopReason=length` module-split recovery, `isNoopShellCommand` + `noopShellSinceProgress` loop-bypass blocking, non-polluting `recentCallSignatures`, `4`-block `evaluateLoopCircuitBreaker` turn abort (skipped cleanly by `shouldSkipGoalGateRetry` in [`extensions/local-goal-gate.ts`](extensions/local-goal-gate.ts) alongside manual `aborted` turns), mode-aware `getEditToolExample`, `extractBashInPlaceEditTarget` tracking, surgical `python3 - <<'EOF'` (`<= 4,000` chars) patch allowance + automatic `findRecentlyModifiedCodeFiles` syntax/`ruff`/`oxlint` checks, and matching schema/module-size/round-trip-invariant rules in [`prompts/local-lean-rules.md`](prompts/local-lean-rules.md).
+  - **Verified `20/20` unit tests & live 4-way Inkling A/B benchmark (`think: low`, `--no-session`):** All `4` modes passed `verify.mjs` on a buggy HTML-in-JS fixture: `standard` won on speed and prefix size (`5` turns, `110.6s`, `5,518` Turn-1 prompt tokens, `0` errors), `--better-edit` produced the fewest output tokens (`2,487` out / `701` reasoning, `9,264` Turn-1 tokens, `129.3s`, `0` errors), `--hashline` finished in `6` turns (`153.9s`, `7,216` Turn-1 tokens, `1` bash error), and `--code-tool` finished in `12` turns (`299.3s`, `7,749` Turn-1 tokens).
 
 - `2026-11-24` (v3 3-model verification + v4 runaway & churn blocks):
   - **v3 3-model Bloomerang results:** Inkling 2 Mini completed in **`24m 51s`** (`-13.4%` vs v2, `-25.6%` vs v1, `0` edit errors across `69` tool calls, `14.1%` reasoning share, `100%` `PROMPT.md` deliverables + exact `output/` filenames, `0` `agent-browser` calls); Surogate 3.7 Flash completed in **`31m 58s`** (**`-59.0%`** vs `r2` `77m 59s`, Phase 2 **`-75.1%`**, `0` `agent-browser` calls, `0` `edits`-array errors, tight `358` calibrated groups); Ornith 1.5 35B-A3B finished Phase 1 in `11m 49s` (`603` calibrated groups, max cluster `9`) and exposed two `32K`-token degeneration turns (`19m 06s`) + `32` test-script micro-edits during Phase 2 before stopping early.

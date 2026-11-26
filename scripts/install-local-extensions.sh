@@ -8,7 +8,7 @@ REPO_DIR="${SCRIPT_DIR:h}"
 EXT_DIR="$HOME/.local/share/pi-local-extensions"
 mkdir -p "$EXT_DIR" "$HOME/.local/bin"
 
-npm install --prefix "$EXT_DIR" --no-audit --no-fund --legacy-peer-deps pi-handoff pi-subagents pi-hashline-edit@0.8.4 happy-dom
+npm install --prefix "$EXT_DIR" --no-audit --no-fund --legacy-peer-deps pi-handoff pi-subagents pi-hashline-edit@0.9.0 pi-code-tool@0.6.2 pi-better-edit@2.21.0 happy-dom
 
 for bin_name in pi-local pi-outline pi-preflight pi-verify-ui; do
   if [[ -f "$REPO_DIR/bin/$bin_name" ]]; then

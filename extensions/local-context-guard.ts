@@ -154,10 +154,12 @@ function summarizeCallSignature(toolName: string, input: Record<string, unknown>
 }
 
 const HARD_HEREDOC_CHARS = Number(process.env.PI_LOCAL_HARD_HEREDOC_CHARS || 1000);
+const PYTHON_PATCH_HEREDOC_MAX_CHARS = Number(process.env.PI_LOCAL_PYTHON_HEREDOC_CHARS || 4000);
 const NOTES_APPEND_MAX_CHARS = Number(process.env.PI_LOCAL_NOTES_HEREDOC_CHARS || 2500);
 const HARD_PYTHON_INLINE_CHARS = Number(process.env.PI_LOCAL_HARD_PYTHON_INLINE_CHARS || 800);
 const HARD_PYTHON_PROBE_STREAK = Number(process.env.PI_LOCAL_HARD_PYTHON_STREAK || 5);
 const INLINE_PROBE_STREAK_WARN = Number(process.env.PI_LOCAL_INLINE_PROBE_WARN || 3);
+const LOOP_CIRCUIT_BREAKER_LIMIT = Number(process.env.PI_LOCAL_LOOP_BREAKER_LIMIT || 4);
 const WORKSPACE_SCRATCH_RE = /^_(?:explore|probe|debug|verify|test|check)[a-z0-9_-]*\.(?:py|js|mjs|cjs)$/i;
 
 export function isWorkspaceScratchScript(toolName: string, input: Record<string, unknown> | undefined): string | null {
@@ -218,18 +220,30 @@ function isNotesAppendHeredoc(toolName: string, input: Record<string, unknown> |
   return /^\s*cat\s+>>\s*(?:\.\/)?notes\.md\s+<<['"]?[A-Za-z0-9_]+['"]?/.test(cmd);
 }
 
+/** Detect surgical inline Python heredoc patches (python3 - <<'EOF') vs full-file shell dumps. */
+export function isPythonPatchHeredoc(cmd: string): boolean {
+  return /^\s*(?:\S*\/)?python3?\s+-\s*<<['"]?[A-Za-z0-9_]+['"]?/.test(String(cmd || ""));
+}
+
 function isLargeHeredocCommand(toolName: string, input: Record<string, unknown> | undefined): boolean {
   const info = isHeredocCommand(toolName, input);
   if (!info.isHeredoc) return false;
   if (isNotesAppendHeredoc(toolName, input)) return false;
+  const cmd = typeof input?.command === "string" ? input.command : "";
+  if (isPythonPatchHeredoc(cmd) && info.length < PYTHON_PATCH_HEREDOC_MAX_CHARS) return false;
   return info.length >= 400;
 }
 
-function isHardBlockedHeredocCommand(toolName: string, input: Record<string, unknown> | undefined): boolean {
+/** Block large shell heredoc file dumps while allowing bounded notes.md and surgical Python patches. */
+export function isHardBlockedHeredocCommand(toolName: string, input: Record<string, unknown> | undefined): boolean {
   const info = isHeredocCommand(toolName, input);
   if (!info.isHeredoc) return false;
+  const cmd = typeof input?.command === "string" ? input.command : "";
   if (isNotesAppendHeredoc(toolName, input)) {
     return info.length >= NOTES_APPEND_MAX_CHARS;
+  }
+  if (isPythonPatchHeredoc(cmd)) {
+    return info.length >= PYTHON_PATCH_HEREDOC_MAX_CHARS;
   }
   return info.length >= HARD_HEREDOC_CHARS;
 }
@@ -247,6 +261,85 @@ function isShellReadProbe(toolName: string, input: Record<string, unknown> | und
   if (isExplicitLineSliceCommand(toolName, input)) return false;
   if (/(?:^|\s)(?:\.\/)?notes\.md(?:\s|$)/.test(cmd)) return false;
   return /^\s*(?:cat|head|tail|sed|nl)\b/.test(cmd) || /\bgrep\b[^\n|]*\|\s*(?:sed|head|tail)\b/.test(cmd);
+}
+
+const NOOP_SHELL_RE =
+  /^\s*(?:echo|printf|true|:)(?:\s+["']?[A-Za-z0-9_ .:-]{0,30}["']?)?\s*$/;
+
+/** Detect trivial no-op shell commands (echo/printf/true/:) used without pipes, redirects, or chaining. */
+export function isNoopShellCommand(
+  toolName: string,
+  input: Record<string, unknown> | undefined,
+): boolean {
+  if (toolName !== "bash" || !input) return false;
+  const cmd = typeof input.command === "string" ? input.command.trim() : "";
+  if (!cmd || /[|><;&`$]/.test(cmd)) return false;
+  return NOOP_SHELL_RE.test(cmd);
+}
+
+/** Extract target source/UI file path from in-place sed -i or perl -i/-pi shell edits. */
+export function extractBashInPlaceEditTarget(cmd: string): string | null {
+  if (!cmd) return null;
+  const segments = cmd.split(/\s*(?:&&|\|\||;|\|)\s*/);
+  for (const seg of segments) {
+    const trimmed = seg.trim();
+    if (!trimmed) continue;
+    const isSedInPlace =
+      /^(?:\S*\/)?sed\b/.test(trimmed) && /(?:^|\s)-(?:[A-Za-z]*i\S*)(?=\s|$)/.test(trimmed);
+    const isPerlInPlace =
+      /^(?:\S*\/)?perl\b/.test(trimmed) && /(?:^|\s)-(?:[A-Za-z]*i\S*)(?=\s|$)/.test(trimmed);
+    if (!isSedInPlace && !isPerlInPlace) continue;
+    const match = trimmed.match(/['"]?([^\s'"]+\.(?:js|mjs|cjs|ts|css|html?|py))['"]?\s*$/i);
+    if (match?.[1]) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+/** Return true when repeated loop blocks should abort a runaway agent turn. */
+export function evaluateLoopCircuitBreaker(streak: number, limit = LOOP_CIRCUIT_BREAKER_LIMIT): boolean {
+  return limit > 0 && streak >= limit;
+}
+
+const MODIFIED_CODE_SKIP_RE = /^(?:node_modules|\.git|__pycache__|output|DataExport)/i;
+const CODE_OR_UI_EXT_RE = /\.(?:py|js|mjs|cjs|ts|css|html?)$/i;
+
+/** Find recently modified code or UI files (up to 1 subdirectory deep) after bash mutations. */
+export function findRecentlyModifiedCodeFiles(cwd: string, sinceMs: number): string[] {
+  const results: string[] = [];
+  if (!cwd) return results;
+  const cutoff = sinceMs - 50;
+
+  const scanDir = (dir: string, prefix: string, depth: number) => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (MODIFIED_CODE_SKIP_RE.test(entry.name) || entry.name.startsWith(".")) continue;
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const abs = path.join(dir, entry.name);
+      if (entry.isFile()) {
+        if (!CODE_OR_UI_EXT_RE.test(entry.name)) continue;
+        try {
+          if (fs.statSync(abs).mtimeMs >= cutoff) {
+            results.push(rel);
+          }
+        } catch {
+          // Ignore transient stat failures.
+        }
+      } else if (entry.isDirectory() && depth < 1) {
+        scanDir(abs, rel, depth + 1);
+      }
+    }
+  };
+
+  scanDir(cwd, "", 0);
+  results.sort();
+  return results.slice(0, 12);
 }
 
 /** Detect repeating 2-to-4 step periodic tool-call cycles (e.g. A->B->C->A->B->C). */
@@ -281,6 +374,20 @@ const AGENT_BROWSER_EVAL_BATCH_NUDGE = Number(process.env.PI_LOCAL_AB_EVAL_NUDGE
 const SHORT_BASH_STREAK_NUDGE = Number(process.env.PI_LOCAL_SHORT_BASH_NUDGE || 4);
 const HASHLINE_EDIT_EXAMPLE =
   '{"path": "file.py", "edits": [{"op": "replace", "pos": "12#ZP", "lines": ["..."]}]}';
+const BETTER_EDIT_EXAMPLE =
+  '{"file": "file.py", "edits": [{"anchor_from": "a1B2", "anchor_to": "c3D4", "text": "..."}]}';
+const STANDARD_EDIT_EXAMPLE =
+  '{"path": "file.py", "edits": [{"oldText": "...", "newText": "..."}]}';
+
+/** Return the edit tool JSON example matching the active pi-local edit mode. */
+export function getEditToolExample(
+  modeOrHashline: boolean | string | undefined = process.env.PI_LOCAL_EDIT_MODE ||
+    (process.env.PI_LOCAL_HASHLINE === "1" ? "hashline" : "standard"),
+): string {
+  if (modeOrHashline === true || modeOrHashline === "hashline") return HASHLINE_EDIT_EXAMPLE;
+  if (modeOrHashline === "better-edit") return BETTER_EDIT_EXAMPLE;
+  return STANDARD_EDIT_EXAMPLE;
+}
 const VERIFY_SCRIPT_CMD_RE =
   /(?:^|[\s/])(?:_?verify|verify_|_?harness|test_)[a-zA-Z0-9_.-]*\.(?:js|mjs|cjs|py)\b/i;
 
@@ -292,13 +399,16 @@ export interface AssistantTurnSnapshot {
   hadToolCallsInSession: boolean;
 }
 
-/** Detect when a local model stops mid-task (blank output after thinking, or announced intent without a tool call). */
+/** Detect when a local model stops mid-task (length-truncated call, blank output after thinking, or announced intent). */
 export function detectPrematureStop(
   snapshot: AssistantTurnSnapshot,
-): "empty_after_thinking" | "announced_intent" | null {
+): "length_truncated" | "empty_after_thinking" | "announced_intent" | null {
   if (!snapshot.hadToolCallsInSession || snapshot.toolCallCount > 0) return null;
   const stop = String(snapshot.stopReason || "").toLowerCase();
-  if (stop !== "stop" && stop !== "length") return null;
+  if (stop === "length") {
+    return "length_truncated";
+  }
+  if (stop !== "stop") return null;
   const trimmed = snapshot.visibleText.trim();
   if (trimmed.length === 0) {
     return "empty_after_thinking";
@@ -895,7 +1005,18 @@ export function repairEditArguments(args: Record<string, unknown>, cwd: string):
     if (normTop.changed) changed = true;
   }
 
-  const filePath = String(args.path ?? args.file_path ?? "");
+  const filePath = String(args.path ?? args.file_path ?? args.file ?? "");
+  const isBetterEditPayload =
+    process.env.PI_LOCAL_EDIT_MODE === "better-edit" ||
+    typeof args.file === "string" ||
+    (Array.isArray(args.edits) &&
+      args.edits.some(
+        (entry) =>
+          entry &&
+          typeof entry === "object" &&
+          typeof (entry as Record<string, unknown>).anchor_from === "string",
+      ));
+  if (isBetterEditPayload) return changed;
   const absPath = resolveWorkspacePath(filePath, cwd);
   if (!absPath) return changed;
 
@@ -1130,7 +1251,7 @@ export function lintFileIssues(filePath: string, cwd: string): FileLintResult {
     );
     if (!ruffRes.ok) {
       for (const line of ruffRes.lines) {
-        if (!/^Found \d+ error/i.test(line) && !/^\[\*\]/.test(line)) {
+        if (!/^Found \d+ error/i.test(line) && !line.startsWith("[*]")) {
           lintErrors.push(line);
         }
       }
@@ -1423,6 +1544,9 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
   let consecutiveAgentBrowserEvals = 0;
   let slowBashCount = 0;
   let consecutiveShortBash = 0;
+  let consecutiveNoopShell = 0;
+  let noopShellSinceProgress = 0;
+  let consecutiveLoopBlocks = 0;
   let piVerifyUiRan = false;
   let hadToolCallsInSession = false;
   let consecutivePrematureRetries = 0;
@@ -1451,7 +1575,11 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     consecutiveAgentBrowserEvals = 0;
     slowBashCount = 0;
     consecutiveShortBash = 0;
+    consecutiveNoopShell = 0;
+    noopShellSinceProgress = 0;
+    consecutiveLoopBlocks = 0;
     piVerifyUiRan = false;
+    (globalThis as typeof globalThis & { __piLocalCircuitBreakerTripped?: boolean }).__piLocalCircuitBreakerTripped = false;
     consecutivePrematureRetries = 0;
     lastUiSourceEdit = null;
     lastAssistantSnapshot = null;
@@ -1463,6 +1591,34 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     cliFamilyCounts.clear();
     errorClassCounts.clear();
     workspaceScratchFiles.clear();
+  }
+
+  function handleLoopBlock(
+    ctx: { ui?: { notify?: (msg: string, type?: string) => void }; abort?: () => void } | undefined,
+    traceEvent: string,
+    details: Record<string, unknown>,
+    reason: string,
+  ): { block: true; reason: string } {
+    consecutiveLoopBlocks += 1;
+    appendLocalTrace("local-context-guard", traceEvent, details);
+    if (evaluateLoopCircuitBreaker(consecutiveLoopBlocks)) {
+      (globalThis as typeof globalThis & { __piLocalCircuitBreakerTripped?: boolean }).__piLocalCircuitBreakerTripped = true;
+      appendLocalTrace("local-context-guard", "loop_circuit_breaker", {
+        streak: consecutiveLoopBlocks,
+        trigger: traceEvent,
+      });
+      ctx?.ui?.notify?.(
+        `Loop circuit breaker tripped after ${consecutiveLoopBlocks} blocked loop calls (${traceEvent}). Aborting runaway turn.`,
+        "warning",
+      );
+      ctx?.abort?.();
+      return {
+        block: true,
+        reason:
+          "Loop circuit breaker tripped after repeated blocked loop calls. Stopping this runaway turn so the user can steer or reset context with /new.",
+      };
+    }
+    return { block: true, reason };
   }
 
   pi.on("session_start", () => {
@@ -1557,6 +1713,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
               if (entry && typeof entry === "object") {
                 const rec = entry as Record<string, unknown>;
                 if (typeof rec.newText === "string") textsToScan.push(rec.newText);
+                if (typeof rec.text === "string") textsToScan.push(rec.text);
                 if (Array.isArray(rec.lines)) textsToScan.push(rec.lines.join("\n"));
               }
             }
@@ -1574,7 +1731,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
         }
       }
 
-      const targetPath = String(input?.path ?? input?.file_path ?? "");
+      const targetPath = String(input?.path ?? input?.file_path ?? input?.file ?? "");
       const churnBlock = checkFileChurnBlock(fileModifyCounts, targetPath);
       if (churnBlock) {
         appendLocalTrace("local-context-guard", "file_churn_blocked", churnBlock);
@@ -1594,35 +1751,60 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       const cmd = typeof input?.command === "string" ? input.command : "";
       const cliBlock = checkCliLoopBlock(cliFamilyCounts, cmd);
       if (cliBlock) {
-        appendLocalTrace("local-context-guard", "cli_loop_blocked", cliBlock);
-        return {
-          block: true,
-          reason: `CLI loop guard: called '${cliBlock.family}' ${cliBlock.count} times in this session (limit ${cliBlock.limit}). Stop turn-by-turn UI/CLI polling; read/fix the source deliverable directly or move to the next deliverable.`,
-        };
+        return handleLoopBlock(
+          ctx,
+          "cli_loop_blocked",
+          cliBlock,
+          `CLI loop guard: called '${cliBlock.family}' ${cliBlock.count} times in this session (limit ${cliBlock.limit}). Stop turn-by-turn UI/CLI polling; read/fix the source deliverable directly or move to the next deliverable.`,
+        );
       }
     }
-    const sig = summarizeCallSignature(toolName, input);
-    if (sig === lastCallSignature) {
-      consecutiveSameCall += 1;
+    let pendingCallSig: string | null = null;
+    if (isNoopShellCommand(toolName, input)) {
+      consecutiveNoopShell += 1;
+      noopShellSinceProgress += 1;
+      if (consecutiveNoopShell >= 2 || noopShellSinceProgress >= 3) {
+        return handleLoopBlock(
+          ctx,
+          "noop_shell_blocked",
+          {
+            streak: consecutiveNoopShell,
+            sinceProgress: noopShellSinceProgress,
+          },
+          "Loop guard: blocked repeated no-op shell command (echo/printf/true). Execute your next real read, edit, write, or verification command immediately.",
+        );
+      }
     } else {
-      lastCallSignature = sig;
-      consecutiveSameCall = 1;
-    }
-    recentCallSignatures.push(sig);
-    if (recentCallSignatures.length > 24) {
-      recentCallSignatures.shift();
-    }
-    const cycle = detectPeriodicToolCycle(recentCallSignatures);
-    if (cycle) {
-      appendLocalTrace("local-context-guard", "cycle_loop_blocked", {
-        tool: toolName,
-        period: cycle.period,
-        repeats: cycle.repeats,
-      });
-      return {
-        block: true,
-        reason: `Loop guard: detected repeating ${cycle.period}-step tool call cycle (${cycle.repeats}x identical sequence). Stop repeating these commands; act on the output you already have using read(path, offset, limit), edit, or write, or advance to the next step.`,
-      };
+      consecutiveNoopShell = 0;
+      const sig = summarizeCallSignature(toolName, input);
+      if (sig === lastCallSignature) {
+        consecutiveSameCall += 1;
+      } else {
+        lastCallSignature = sig;
+        consecutiveSameCall = 1;
+      }
+      if (consecutiveSameCall >= 3) {
+        return handleLoopBlock(
+          ctx,
+          "duplicate_call_blocked",
+          { tool: toolName, streak: consecutiveSameCall },
+          "Loop guard: this exact tool call already ran twice with the same arguments. Do not repeat it again. Use the results you already have, move to the next deliverable, or update notes.md and call phase_handoff.",
+        );
+      }
+      const cycle = detectPeriodicToolCycle([...recentCallSignatures, sig]);
+      if (cycle) {
+        return handleLoopBlock(
+          ctx,
+          "cycle_loop_blocked",
+          {
+            tool: toolName,
+            period: cycle.period,
+            repeats: cycle.repeats,
+          },
+          `Loop guard: detected repeating ${cycle.period}-step tool call cycle (${cycle.repeats}x identical sequence). Stop repeating these commands; act on the output you already have using read(path, offset, limit), edit, or write, or advance to the next step.`,
+        );
+      }
+      pendingCallSig = sig;
     }
 
     if (isTmpScratchScriptWrite(toolName, input)) {
@@ -1660,7 +1842,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
         return {
           block: true,
           reason:
-            `Local tool guard: blocked large inline python3 -c script (>= 800 chars). Put reusable logic into a .py file with write(path, content), or patch existing files with edit(${HASHLINE_EDIT_EXAMPLE}).`,
+            `Local tool guard: blocked large inline python3 -c script (>= 800 chars). Put reusable logic into a .py file with write(path, content), or patch existing files with edit(${getEditToolExample()}).`,
         };
       }
       if (consecutivePythonProbes >= HARD_PYTHON_PROBE_STREAK) {
@@ -1677,22 +1859,35 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
         return {
           block: true,
           reason:
-            `Loop guard + heredoc guard: you already tried this blocked heredoc. Stop calling bash for this write. Call edit(${HASHLINE_EDIT_EXAMPLE}) to update an existing file or write(path, content) for a new file.`,
+            `Loop guard + heredoc guard: you already tried this blocked heredoc. Stop calling bash for this write. Call edit(${getEditToolExample()}) to update an existing file or write(path, content) for a new file.`,
         };
       }
       return {
         block: true,
         reason:
-          `Local tool guard: blocked large multi-line bash heredoc (>= 1000 chars). Use write(path, content) for new files or edit(${HASHLINE_EDIT_EXAMPLE}) to update existing files.`,
+          `Local tool guard: blocked large multi-line bash heredoc (>= 1000 chars). Use write(path, content) for new files or edit(${getEditToolExample()}) to update existing files.`,
       };
     }
 
-    if (consecutiveSameCall >= 3) {
-      return {
-        block: true,
-        reason:
-          "Loop guard: this exact tool call already ran twice with the same arguments. Do not repeat it again. Use the results you already have, move to the next deliverable, or update notes.md and call phase_handoff.",
-      };
+    if (pendingCallSig) {
+      consecutiveLoopBlocks = 0;
+      (globalThis as typeof globalThis & { __piLocalCircuitBreakerTripped?: boolean }).__piLocalCircuitBreakerTripped = false;
+      recentCallSignatures.push(pendingCallSig);
+      if (recentCallSignatures.length > 24) {
+        recentCallSignatures.shift();
+      }
+    }
+    if (
+      toolName === "write" ||
+      toolName === "edit" ||
+      toolName === "python" ||
+      toolName === "code" ||
+      (toolName === "bash" &&
+        typeof input?.command === "string" &&
+        (/\bpi-verify-ui\b/.test(input.command) ||
+          (!isPythonInlineProbe(toolName, input) && /\b(?:python3?|node)\b/.test(input.command))))
+    ) {
+      noopShellSinceProgress = 0;
     }
   });
 
@@ -1713,7 +1908,10 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       consecutiveShellReadProbes += 1;
       consecutivePythonProbes = 0;
       consecutiveAgentBrowserEvals = 0;
-    } else if (toolName === "write" || toolName === "edit" || toolName === "read" || toolName === "bash") {
+    } else if (
+      (toolName === "write" || toolName === "edit" || toolName === "read" || toolName === "bash") &&
+      !isNoopShellCommand(toolName, event.input)
+    ) {
       consecutivePythonProbes = 0;
       consecutiveShellReadProbes = 0;
       if (toolName !== "bash") {
@@ -1769,7 +1967,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       consecutiveShellReadProbes % INLINE_PROBE_STREAK_WARN === 0
     ) {
       hints.push(
-        `[Local efficiency hint: ${consecutiveShellReadProbes} consecutive bash cat/head/tail/sed reads. Prefer read(path, offset, limit) or edit(${HASHLINE_EDIT_EXAMPLE}) instead of chaining shell reads.]`,
+        `[Local efficiency hint: ${consecutiveShellReadProbes} consecutive bash cat/head/tail/sed reads. Prefer read(path, offset, limit) or edit(${getEditToolExample()}) instead of chaining shell reads.]`,
       );
     }
 
@@ -1838,7 +2036,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
     baselineLintCounts.delete(callId);
 
     if (toolName === "write" || toolName === "edit") {
-      const targetPath = String(event.input?.path ?? event.input?.file_path ?? "");
+      const targetPath = String(event.input?.path ?? event.input?.file_path ?? event.input?.file ?? "");
       if (targetPath) {
         const churn = evaluateFileModifyChurn(fileModifyCounts, targetPath);
         if (churn?.shouldNudge) {
@@ -1969,6 +2167,66 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
         }
       }
 
+      if (!event.isError) {
+        const inPlaceTarget = extractBashInPlaceEditTarget(cmd);
+        if (inPlaceTarget) {
+          appendLocalTrace("local-context-guard", "bash_in_place_edit", { target: inPlaceTarget });
+          hints.push(
+            `[Edit tool preference: Modified ${path.basename(inPlaceTarget)} via shell in-place edit. Use edit(path, ...) instead of sed -i / perl -pi so automatic syntax and lint checks run.]`,
+          );
+        }
+        if (startedAt !== undefined && (inPlaceTarget || /\bpython3?\b/.test(cmd))) {
+          const modifiedFiles = findRecentlyModifiedCodeFiles(ctx.cwd, startedAt);
+          for (const relPath of modifiedFiles) {
+            if (/\.(?:css|html?|js|mjs|cjs|ts)$/i.test(relPath) && !isVerifyHelperFile(relPath)) {
+              try {
+                const absTarget = resolveWorkspacePath(relPath, ctx.cwd);
+                if (absTarget && fs.existsSync(absTarget)) {
+                  lastUiSourceEdit = {
+                    file: path.basename(absTarget),
+                    mtimeMs: fs.statSync(absTarget).mtimeMs,
+                  };
+                }
+              } catch {
+                // Ignore stat failures on transient paths.
+              }
+              for (const trackedPath of Array.from(fileModifyCounts.keys())) {
+                if (isVerifyHelperFile(trackedPath)) {
+                  fileModifyCounts.delete(trackedPath);
+                }
+              }
+            }
+            if (/\.(?:py|js|mjs|cjs|ts)$/i.test(relPath)) {
+              const lintRes = lintFileIssues(relPath, ctx.cwd);
+              if (lintRes.syntaxError || lintRes.lintErrors.length > 0) {
+                const parts: string[] = [];
+                if (lintRes.syntaxError) parts.push(`Syntax error:\n${lintRes.syntaxError}`);
+                if (lintRes.lintErrors.length > 0) {
+                  parts.push(`Lint issues:\n${lintRes.lintErrors.slice(0, 6).join("\n")}`);
+                }
+                hints.push(`[ACTION REQUIRED: Bash mutation in ${relPath} has error(s):\n${parts.join("\n")}\nFix these before moving on.]`);
+              }
+            }
+            if (relPath.toLowerCase().endsWith(".py")) {
+              try {
+                const absPy = resolveWorkspacePath(relPath, ctx.cwd);
+                if (absPy) {
+                  const st = fs.statSync(absPy);
+                  if (st.isFile() && st.size > 0 && st.size <= MAX_PY_PERF_SCAN_BYTES) {
+                    const hazards = checkPythonPerfHazards(fs.readFileSync(absPy, "utf-8"));
+                    if (hazards.length > 0) {
+                      hints.push(`[ACTION REQUIRED: Static O(K^2) hazard(s) in ${relPath}:\n${hazards.join("\n")}]`);
+                    }
+                  }
+                }
+              } catch {
+                // Ignore unreadable files.
+              }
+            }
+          }
+        }
+      }
+
       if (/\bpi-verify-ui\b/.test(cmd)) {
         piVerifyUiRan = true;
       } else if (!piVerifyUiRan && /\b(?:agent-browser|browser-use)\b/.test(cmd)) {
@@ -2081,7 +2339,7 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
         }
         if (/requires an "edits" array/i.test(fullText)) {
           hints.push(
-            `[Edit schema hint: Pass "edits" as a real JSON array of objects, never a single-quoted string. Example: ${HASHLINE_EDIT_EXAMPLE}]`,
+            `[Edit schema hint: Pass "edits" as a real JSON array of objects, never a single-quoted string. Example: ${getEditToolExample()}]`,
           );
         } else if (/\[E_BAD_REF\]|\[E_STALE_ANCHOR\]/i.test(fullText)) {
           hints.push(
@@ -2185,7 +2443,9 @@ export default function localContextGuardExtension(pi: ExtensionAPI) {
       "info",
     );
     pi.sendUserMessage(
-      "You stopped mid-task without calling a tool or finishing your response. Continue immediately: execute your next tool call, verify all deliverables, and write your final summary only when everything is complete.",
+      reason === "length_truncated"
+        ? "Your previous response hit the output token limit (stopReason=length) before finishing its tool call, so the truncated call was dropped. Do NOT retry the same oversized single-file write: split large code into smaller modules (<= 250-300 lines each) or write a compact skeleton and patch incrementally with edit."
+        : "You stopped mid-task without calling a tool or finishing your response. Continue immediately: execute your next tool call, verify all deliverables, and write your final summary only when everything is complete.",
       { deliverAs: "followUp" },
     );
   });

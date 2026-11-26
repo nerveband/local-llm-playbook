@@ -14,10 +14,17 @@ import {
   detectPrematureStop,
   detectStaleHtmlBundle,
   evaluateFileModifyChurn,
+  evaluateLoopCircuitBreaker,
   extractAgentBrowserSessions,
+  extractBashInPlaceEditTarget,
   extractCliCommandFamily,
   findClosestEditLineHint,
+  findRecentlyModifiedCodeFiles,
+  getEditToolExample,
   inspectJsonClusterSkew,
+  isHardBlockedHeredocCommand,
+  isNoopShellCommand,
+  isPythonPatchHeredoc,
   isRootFilesystemFind,
   isTmpScratchScriptWrite,
   isVerifyHelperFile,
@@ -28,7 +35,7 @@ import {
   repairMacOsTimeoutCommand,
   repairMisnamedCliToolCall,
 } from "../extensions/local-context-guard.ts";
-import { evaluateVerifySpec } from "../extensions/local-goal-gate.ts";
+import { evaluateVerifySpec, shouldSkipGoalGateRetry } from "../extensions/local-goal-gate.ts";
 import { parseCriticVerdict, collectCriticBundle, shouldSkipAutoCriticForProvider } from "../extensions/local-critic.ts";
 import {
   detectThinkingLeak,
@@ -801,4 +808,80 @@ test("thinking-off safety: explicit enable_thinking=false injection and output l
     detectThinkingLeak("off", { content: [{ type: "text", text: "<think>hmm</think>42" }] }, 0).leaked,
     true,
   );
+});
+
+test("truncation recovery, noop shell block, and bash in-place edit tracking", () => {
+  assert.equal(
+    detectPrematureStop({ stopReason: "length", toolCallCount: 0, visibleText: "", thinkingChars: 1200, hadToolCallsInSession: true }),
+    "length_truncated",
+  );
+  assert.equal(
+    detectPrematureStop({ stopReason: "length", toolCallCount: 0, visibleText: "partial text", thinkingChars: 200, hadToolCallsInSession: true }),
+    "length_truncated",
+  );
+
+  assert.equal(isNoopShellCommand("bash", { command: "echo stop" }), true);
+  assert.equal(isNoopShellCommand("bash", { command: "echo x2" }), true);
+  assert.equal(isNoopShellCommand("bash", { command: "true" }), true);
+  assert.equal(isNoopShellCommand("bash", { command: ":" }), true);
+  assert.equal(isNoopShellCommand("bash", { command: "echo hi > a.txt" }), false);
+  assert.equal(isNoopShellCommand("bash", { command: "echo ok && ls" }), false);
+  assert.equal(isNoopShellCommand("bash", { command: "sed -n '1,5p' a.js" }), false);
+
+  assert.equal(extractBashInPlaceEditTarget("sed -i '' 's/a/b/' review_ui.js"), "review_ui.js");
+  assert.equal(extractBashInPlaceEditTarget("sed -i 's/a/b/' app.py"), "app.py");
+  assert.equal(extractBashInPlaceEditTarget("perl -pi -e 's/a/b/' style.css"), "style.css");
+  assert.equal(extractBashInPlaceEditTarget("sed -n '51,58p' review_ui.js"), null);
+
+  assert.match(getEditToolExample(true), /"op":\s*"replace"/);
+  assert.match(getEditToolExample("better-edit"), /"file":\s*"file\.py"/);
+  assert.match(getEditToolExample("better-edit"), /"anchor_from"/);
+  assert.match(getEditToolExample(false), /"oldText"/);
+  assert.doesNotMatch(getEditToolExample(false), /12#ZP/);
+});
+
+test("goal-gate abort skip, surgical python heredoc, recent file watcher, loop breaker, and monty code-tool", async () => {
+  assert.equal(shouldSkipGoalGateRetry({ stopReason: "aborted" }), true);
+  assert.equal(shouldSkipGoalGateRetry({ stopReason: "stop", circuitBreakerTripped: true }), true);
+  assert.equal(shouldSkipGoalGateRetry({ stopReason: "stop", hasHandoff: true }), true);
+  assert.equal(shouldSkipGoalGateRetry({ stopReason: "stop" }), false);
+
+  assert.equal(isPythonPatchHeredoc("python3 - <<'EOF'\nprint(1)\nEOF"), true);
+  assert.equal(isPythonPatchHeredoc("cat > app.js <<'EOF'\nconsole.log(1)\nEOF"), false);
+  const py2500 = `python3 - <<'EOF'\n# ${"x".repeat(2500)}\nEOF`;
+  const py5000 = `python3 - <<'EOF'\n# ${"x".repeat(5000)}\nEOF`;
+  const cat1200 = `cat > app.js <<'EOF'\n// ${"x".repeat(1200)}\nEOF`;
+  assert.equal(isHardBlockedHeredocCommand("bash", { command: py2500 }), false);
+  assert.equal(isHardBlockedHeredocCommand("bash", { command: py5000 }), true);
+  assert.equal(isHardBlockedHeredocCommand("bash", { command: cat1200 }), true);
+
+  assert.equal(evaluateLoopCircuitBreaker(3), false);
+  assert.equal(evaluateLoopCircuitBreaker(4), true);
+
+  withTempDir((dir) => {
+    const oldFile = path.join(dir, "old.py");
+    const newJs = path.join(dir, "app.js");
+    fs.mkdirSync(path.join(dir, "DataExport-2026-11-21"));
+    const exportCsv = path.join(dir, "DataExport-2026-11-21", "Constituents.csv");
+    fs.writeFileSync(oldFile, "x = 1\n");
+    fs.writeFileSync(exportCsv, "a,b\n1,2\n");
+    const past = Date.now() / 1000 - 30;
+    fs.utimesSync(oldFile, past, past);
+    const sinceMs = Date.now();
+    fs.writeFileSync(newJs, "console.log(1);\n");
+    const modified = findRecentlyModifiedCodeFiles(dir, sinceMs);
+    assert.deepEqual(modified, ["app.js"]);
+  });
+
+  const piCodeToolPath = path.join(
+    os.homedir(),
+    ".local/share/pi-local-extensions/node_modules/pi-code-tool/dist/index.js",
+  );
+  if (fs.existsSync(piCodeToolPath)) {
+    const { CodeRunner } = await import(piCodeToolPath);
+    const runner = new CodeRunner({ tools: [] });
+    const res = await runner.run("print(21 * 2)");
+    assert.equal(res.status, "ok");
+    assert.equal(res.stdout.trim(), "42");
+  }
 });
